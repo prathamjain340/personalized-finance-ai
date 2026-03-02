@@ -1,0 +1,537 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Voice Latency Lab</title>
+  <style>
+    :root {
+      --bg: #f4f7f9;
+      --panel: #ffffff;
+      --ink: #12232f;
+      --muted: #5f7483;
+      --accent: #0b6fa4;
+      --ok: #1f7a4d;
+      --warn: #9a5d00;
+      --border: #d8e2e8;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Segoe UI", "Noto Sans", sans-serif;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at 10% 10%, #d6ecf8 0%, transparent 40%),
+        radial-gradient(circle at 90% 20%, #e8f3dc 0%, transparent 35%),
+        var(--bg);
+      min-height: 100vh;
+      padding: 20px;
+    }
+    .wrap {
+      max-width: 1040px;
+      margin: 0 auto;
+      display: grid;
+      gap: 14px;
+    }
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 14px;
+      box-shadow: 0 6px 18px rgba(8, 32, 50, 0.06);
+    }
+    h1 {
+      margin: 0;
+      font-size: 24px;
+      letter-spacing: 0.2px;
+    }
+    .sub {
+      margin-top: 6px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(160px, 1fr));
+      gap: 10px;
+    }
+    .grid-2 {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+    }
+    label {
+      display: block;
+      font-size: 12px;
+      color: var(--muted);
+      margin-bottom: 6px;
+    }
+    input, button, select, textarea {
+      width: 100%;
+      padding: 9px 10px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      font: inherit;
+      color: var(--ink);
+      background: #fff;
+    }
+    button {
+      cursor: pointer;
+      font-weight: 600;
+    }
+    .btn-primary {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #fff;
+    }
+    .btn-muted {
+      background: #edf3f6;
+    }
+    .btn-danger {
+      background: #c84a4a;
+      border-color: #c84a4a;
+      color: #fff;
+    }
+    .row {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .row button {
+      width: auto;
+      min-width: 130px;
+    }
+    .pill {
+      display: inline-block;
+      padding: 4px 8px;
+      border-radius: 999px;
+      font-size: 12px;
+      background: #ecf4f8;
+      color: #27475c;
+      border: 1px solid #d5e4ee;
+      margin-right: 6px;
+      margin-bottom: 6px;
+    }
+    .mono {
+      font-family: "Consolas", "SFMono-Regular", monospace;
+      font-size: 12px;
+      color: #17374a;
+      word-break: break-word;
+    }
+    .status {
+      font-size: 13px;
+      color: var(--muted);
+      margin-top: 8px;
+      min-height: 18px;
+    }
+    .ok { color: var(--ok); }
+    .warn { color: var(--warn); }
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(120px, 1fr));
+      gap: 8px;
+    }
+    .metric {
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 8px;
+      background: #fbfdff;
+    }
+    .metric .k {
+      color: var(--muted);
+      font-size: 11px;
+    }
+    .metric .v {
+      margin-top: 4px;
+      font-size: 18px;
+      font-weight: 700;
+      color: #13374b;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 12px;
+    }
+    th, td {
+      text-align: left;
+      border-bottom: 1px solid var(--border);
+      padding: 7px 6px;
+    }
+    th {
+      color: var(--muted);
+      font-weight: 600;
+      background: #f7fbfd;
+      position: sticky;
+      top: 0;
+    }
+    .table-wrap {
+      max-height: 260px;
+      overflow: auto;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+    }
+    @media (max-width: 900px) {
+      .grid, .grid-2, .metrics {
+        grid-template-columns: 1fr 1fr;
+      }
+    }
+    @media (max-width: 640px) {
+      .grid, .grid-2, .metrics {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <h1>Voice Endpoint Latency Lab</h1>
+      <div class="sub">Use this page to test <span class="mono">/finance/session/ask-voice</span> and inspect STT/LLM/TTS timings per turn.</div>
+    </div>
+
+    <div class="card">
+      <div class="grid">
+        <div>
+          <label>API Base URL</label>
+          <input id="apiBase" />
+        </div>
+        <div>
+          <label>User ID</label>
+          <input id="userId" value="12345" />
+        </div>
+        <div>
+          <label>Session ID</label>
+          <input id="sessionId" readonly />
+        </div>
+        <div>
+          <label>Actions</label>
+          <button id="initBtn" class="btn-primary">Init Session</button>
+        </div>
+      </div>
+      <div class="status" id="initStatus"></div>
+      <div id="sessionMeta"></div>
+    </div>
+
+    <div class="card">
+      <div class="grid-2">
+        <div>
+          <label>Recorder</label>
+          <div class="row">
+            <button id="recordBtn" class="btn-primary">Start Recording</button>
+            <button id="stopBtn" class="btn-danger" disabled>Stop</button>
+            <button id="sendBtn" class="btn-muted" disabled>Send Recording</button>
+          </div>
+          <div class="status" id="recordStatus"></div>
+          <audio id="recordPreview" controls style="width:100%; margin-top:8px;"></audio>
+        </div>
+        <div>
+          <label>Or upload audio file</label>
+          <input id="fileInput" type="file" accept="audio/*" />
+          <button id="sendFileBtn" class="btn-muted" style="margin-top:8px;">Send File</button>
+          <div class="status" id="fileStatus"></div>
+          <audio id="responsePlayer" controls style="width:100%; margin-top:8px;"></audio>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="metrics" id="metrics">
+        <div class="metric"><div class="k">Client Roundtrip</div><div class="v" id="mClient">-</div></div>
+        <div class="metric"><div class="k">Server STT</div><div class="v" id="mStt">-</div></div>
+        <div class="metric"><div class="k">Server Turn Ctrl</div><div class="v" id="mCtrl">-</div></div>
+        <div class="metric"><div class="k">Server Text Gen</div><div class="v" id="mText">-</div></div>
+        <div class="metric"><div class="k">Server TTS</div><div class="v" id="mTts">-</div></div>
+        <div class="metric"><div class="k">Server Other</div><div class="v" id="mOther">-</div></div>
+        <div class="metric"><div class="k">Server Total</div><div class="v" id="mTotal">-</div></div>
+        <div class="metric"><div class="k">Net + Browser</div><div class="v" id="mNet">-</div></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="grid-2">
+        <div>
+          <label>Transcript</label>
+          <textarea id="transcript" rows="7" readonly></textarea>
+        </div>
+        <div>
+          <label>Response Text</label>
+          <textarea id="responseText" rows="7" readonly></textarea>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div style="display:flex;justify-content:space-between;align-items:center;">
+        <strong>Timing History</strong>
+        <button id="clearHistoryBtn" class="btn-muted" style="width:auto;">Clear</button>
+      </div>
+      <div class="table-wrap" style="margin-top:8px;">
+        <table>
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>Client ms</th>
+              <th>STT</th>
+              <th>Turn Ctrl</th>
+              <th>Text Gen</th>
+              <th>TTS</th>
+              <th>Other</th>
+              <th>Server Total</th>
+              <th>Net+Browser</th>
+            </tr>
+          </thead>
+          <tbody id="historyBody"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+
+    const state = {
+      mediaRecorder: null,
+      chunks: [],
+      latestBlob: null,
+      history: [],
+    };
+
+    $("apiBase").value = `${window.location.protocol}//${window.location.host}`;
+
+    function setStatus(el, msg, cls = "") {
+      el.className = `status ${cls}`.trim();
+      el.textContent = msg || "";
+    }
+
+    function ms(value) {
+      if (typeof value !== "number" || Number.isNaN(value)) return "-";
+      return `${value.toFixed(0)} ms`;
+    }
+
+    function renderMetrics(clientMs, timing) {
+      const stt = timing?.stt_ms ?? null;
+      const ctrl = timing?.turn_control_ms ?? null;
+      const text = timing?.text_generation_ms ?? null;
+      const tts = timing?.tts_generation_ms ?? null;
+      const other = timing?.other_overhead_ms ?? null;
+      const total = timing?.total_request_ms ?? null;
+      const net = (typeof clientMs === "number" && typeof total === "number") ? Math.max(0, clientMs - total) : null;
+
+      $("mClient").textContent = ms(clientMs);
+      $("mStt").textContent = ms(stt);
+      $("mCtrl").textContent = ms(ctrl);
+      $("mText").textContent = ms(text);
+      $("mTts").textContent = ms(tts);
+      $("mOther").textContent = ms(other);
+      $("mTotal").textContent = ms(total);
+      $("mNet").textContent = ms(net);
+
+      if (typeof clientMs === "number") {
+        state.history.unshift({
+          clientMs,
+          stt,
+          ctrl,
+          text,
+          tts,
+          other,
+          total,
+          net,
+        });
+        state.history = state.history.slice(0, 50);
+      }
+      renderHistory();
+    }
+
+    function renderHistory() {
+      const body = $("historyBody");
+      body.innerHTML = "";
+      state.history.forEach((row, idx) => {
+        const tr = document.createElement("tr");
+        tr.innerHTML = `
+          <td>${idx + 1}</td>
+          <td>${ms(row.clientMs)}</td>
+          <td>${ms(row.stt)}</td>
+          <td>${ms(row.ctrl)}</td>
+          <td>${ms(row.text)}</td>
+          <td>${ms(row.tts)}</td>
+          <td>${ms(row.other)}</td>
+          <td>${ms(row.total)}</td>
+          <td>${ms(row.net)}</td>
+        `;
+        body.appendChild(tr);
+      });
+    }
+
+    function blobToBase64(blob) {
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onloadend = () => {
+          const dataUrl = reader.result || "";
+          const base64 = String(dataUrl).split(",")[1] || "";
+          resolve(base64);
+        };
+        reader.onerror = reject;
+        reader.readAsDataURL(blob);
+      });
+    }
+
+    async function initSession() {
+      const apiBase = $("apiBase").value.trim();
+      const userId = $("userId").value.trim();
+      if (!apiBase || !userId) {
+        setStatus($("initStatus"), "API base and user id are required.", "warn");
+        return;
+      }
+
+      setStatus($("initStatus"), "Initializing...");
+      try {
+        const res = await fetch(`${apiBase}/finance/session/init`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ user_id: userId }),
+        });
+        if (!res.ok) throw new Error(`Init failed: HTTP ${res.status}`);
+        const data = await res.json();
+        $("sessionId").value = data.session_id || "";
+        setStatus($("initStatus"), "Session initialized.", "ok");
+
+        const pills = [];
+        pills.push(`<span class="pill">session: ${data.session_id}</span>`);
+        if (data.greeting) pills.push(`<span class="pill">greeting: ${data.greeting}</span>`);
+        $("sessionMeta").innerHTML = pills.join("");
+
+        if (data.greeting_audio_base64) {
+          $("responsePlayer").src = `data:audio/mpeg;base64,${data.greeting_audio_base64}`;
+        }
+      } catch (err) {
+        setStatus($("initStatus"), String(err), "warn");
+      }
+    }
+
+    async function startRecording() {
+      setStatus($("recordStatus"), "");
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        const preferred = [
+          "audio/webm;codecs=opus",
+          "audio/webm",
+          "audio/mp4",
+        ];
+        let mimeType = "";
+        for (const m of preferred) {
+          if (window.MediaRecorder && MediaRecorder.isTypeSupported(m)) {
+            mimeType = m;
+            break;
+          }
+        }
+
+        state.chunks = [];
+        state.mediaRecorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
+        state.mediaRecorder.ondataavailable = (e) => {
+          if (e.data && e.data.size > 0) state.chunks.push(e.data);
+        };
+        state.mediaRecorder.onstop = () => {
+          const finalType = state.mediaRecorder.mimeType || "audio/webm";
+          state.latestBlob = new Blob(state.chunks, { type: finalType });
+          $("recordPreview").src = URL.createObjectURL(state.latestBlob);
+          $("sendBtn").disabled = false;
+          setStatus($("recordStatus"), `Recording ready (${Math.round(state.latestBlob.size / 1024)} KB, ${finalType}).`, "ok");
+          stream.getTracks().forEach(t => t.stop());
+        };
+        state.mediaRecorder.start();
+        $("recordBtn").disabled = true;
+        $("stopBtn").disabled = false;
+        $("sendBtn").disabled = true;
+        setStatus($("recordStatus"), "Recording...", "ok");
+      } catch (err) {
+        setStatus($("recordStatus"), String(err), "warn");
+      }
+    }
+
+    function stopRecording() {
+      if (state.mediaRecorder && state.mediaRecorder.state !== "inactive") {
+        state.mediaRecorder.stop();
+      }
+      $("recordBtn").disabled = false;
+      $("stopBtn").disabled = true;
+    }
+
+    async function callAskVoice(blob, fileName = "recording.webm") {
+      const apiBase = $("apiBase").value.trim();
+      const sessionId = $("sessionId").value.trim();
+      if (!apiBase || !sessionId) {
+        throw new Error("Initialize session first.");
+      }
+      if (!blob) {
+        throw new Error("No audio available.");
+      }
+
+      const audioBase64 = await blobToBase64(blob);
+      const payload = {
+        session_id: sessionId,
+        audio_base64: audioBase64,
+        audio_mime_type: blob.type || "audio/webm",
+        audio_filename: fileName,
+      };
+
+      const clientStart = performance.now();
+      const res = await fetch(`${apiBase}/finance/session/ask-voice`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const clientMs = performance.now() - clientStart;
+      if (!res.ok) {
+        const text = await res.text();
+        throw new Error(`ask-voice failed: HTTP ${res.status} ${text}`);
+      }
+      const data = await res.json();
+
+      $("transcript").value = data.transcript || "";
+      $("responseText").value = data.response_text || "";
+      if (data.response_audio_base64) {
+        $("responsePlayer").src = `data:audio/mpeg;base64,${data.response_audio_base64}`;
+      }
+
+      renderMetrics(clientMs, data.timing || null);
+      return data;
+    }
+
+    async function sendRecording() {
+      setStatus($("recordStatus"), "Sending...");
+      try {
+        await callAskVoice(state.latestBlob, "recording.webm");
+        setStatus($("recordStatus"), "Response received.", "ok");
+      } catch (err) {
+        setStatus($("recordStatus"), String(err), "warn");
+      }
+    }
+
+    async function sendFile() {
+      const file = $("fileInput").files?.[0];
+      if (!file) {
+        setStatus($("fileStatus"), "Pick an audio file first.", "warn");
+        return;
+      }
+      setStatus($("fileStatus"), "Sending...");
+      try {
+        await callAskVoice(file, file.name || "upload_audio");
+        setStatus($("fileStatus"), "Response received.", "ok");
+      } catch (err) {
+        setStatus($("fileStatus"), String(err), "warn");
+      }
+    }
+
+    $("initBtn").addEventListener("click", initSession);
+    $("recordBtn").addEventListener("click", startRecording);
+    $("stopBtn").addEventListener("click", stopRecording);
+    $("sendBtn").addEventListener("click", sendRecording);
+    $("sendFileBtn").addEventListener("click", sendFile);
+    $("clearHistoryBtn").addEventListener("click", () => {
+      state.history = [];
+      renderHistory();
+      renderMetrics(null, null);
+    });
+  </script>
+</body>
+</html>

@@ -1,0 +1,8 @@
+[project]
+name = "finance_project"
+version = "0.1.0"
+description = "Hyper-personalized finance reasoning engine"
+authors = [{ name = "Pratham" }]
+
+[tool.setuptools.packages.find]
+where = ["."]
