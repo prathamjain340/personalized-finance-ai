@@ -1,6 +1,7 @@
 venv/
 __pycache__/
-.envdata/
+.env
+data/
 *.db
 finance_project.egg-info/
 .pytest_cache/
