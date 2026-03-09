@@ -1,4 +1,5 @@
 import datetime as dt
+import json
 import os
 import re
 import xml.etree.ElementTree as ET
@@ -6,6 +7,7 @@ from typing import Any, Optional
 from urllib.parse import quote_plus
 
 import requests
+from finance_project.core.llm.client import generate_response
 
 
 _LIVE_ENABLED = os.getenv("LIVE_DATA_ENABLED", "true").lower() not in {"0", "false", "off", "no"}
@@ -13,22 +15,59 @@ _HTTP_TIMEOUT_SECONDS = float(os.getenv("LIVE_DATA_HTTP_TIMEOUT_SECONDS", "4"))
 _MAX_HEADLINES = int(os.getenv("LIVE_DATA_MAX_HEADLINES", "3"))
 
 
-def classify_live_data_kind(query: str) -> Optional[str]:
-    text = (query or "").strip().lower()
+_ALLOWED_LIVE_KINDS = {"weather", "stock", "news"}
+
+
+def _extract_json_object(raw_text: str) -> dict | None:
+    text = str(raw_text or "").strip()
     if not text:
         return None
 
-    weather_terms = {"weather", "temperature", "rain", "forecast", "humid", "humidity"}
-    stock_terms = {"stock", "share price", "quote", "market price", "nse", "bse", "ticker"}
-    news_terms = {"latest news", "news on", "headlines", "what's new", "update on", "current affairs"}
+    try:
+        payload = json.loads(text)
+        if isinstance(payload, dict):
+            return payload
+    except json.JSONDecodeError:
+        pass
 
-    if any(term in text for term in weather_terms):
-        return "weather"
-    if any(term in text for term in stock_terms):
-        return "stock"
-    if any(term in text for term in news_terms):
-        return "news"
-    return None
+    match = re.search(r"\{[\s\S]*\}", text)
+    if not match:
+        return None
+
+    try:
+        payload = json.loads(match.group(0))
+        return payload if isinstance(payload, dict) else None
+    except json.JSONDecodeError:
+        return None
+
+
+def classify_live_data_kind(query: str) -> Optional[str]:
+    text = (query or "").strip()
+    if not text:
+        return None
+
+    prompt = (
+        "You classify whether a user asks for live data updates.\n"
+        "Classify the current message into exactly one kind: weather, stock, news, none.\n"
+        "Support multilingual and transliterated input.\n"
+        "Choose weather/stock/news only when the user asks for current/live information.\n"
+        "If the message is educational, conversational, planning, or unclear, choose none.\n\n"
+        f"User message: {text}\n\n"
+        "Return STRICT JSON only with key 'kind' and value in [weather, stock, news, none]."
+    )
+
+    try:
+        raw = generate_response(prompt, operation="turn_control")
+        payload = _extract_json_object(raw)
+        if not isinstance(payload, dict):
+            return None
+
+        kind = str(payload.get("kind") or "").strip().lower()
+        if kind in _ALLOWED_LIVE_KINDS:
+            return kind
+        return None
+    except Exception:
+        return None
 
 
 def maybe_fetch_live_data(query: str, profile: Optional[dict] = None) -> Optional[dict[str, Any]]:
@@ -71,14 +110,8 @@ def _fetch_weather(query: str, profile: dict) -> dict[str, Any]:
         }
 
     try:
-        geo = requests.get(
-            "https://geocoding-api.open-meteo.com/v1/search",
-            params={"name": location, "count": 1, "language": "en", "format": "json"},
-            timeout=_HTTP_TIMEOUT_SECONDS,
-        )
-        geo.raise_for_status()
-        geo_data = geo.json()
-        results = geo_data.get("results") or []
+        resolved_location, top = _geocode_with_retry(location)
+        results = [top] if top else []
         if not results:
             return {
                 "kind": "weather",
@@ -89,10 +122,9 @@ def _fetch_weather(query: str, profile: dict) -> dict[str, Any]:
                 "as_of": _now_utc_iso(),
             }
 
-        top = results[0]
         lat = top.get("latitude")
         lon = top.get("longitude")
-        place_name = top.get("name") or location
+        place_name = top.get("name") or resolved_location
         country = top.get("country_code") or top.get("country")
 
         forecast = requests.get(
@@ -134,6 +166,79 @@ def _fetch_weather(query: str, profile: dict) -> dict[str, Any]:
             "sources": ["https://open-meteo.com/"],
             "as_of": _now_utc_iso(),
         }
+
+
+def _geocode_with_retry(location: str) -> tuple[str, dict | None]:
+    text = _to_text(location) or ""
+    has_non_latin = bool(re.search(r"[؀-ۿऀ-ॿ]", text))
+
+    # For non-Latin inputs, transliterate first to reduce false matches like Dal? (IR/CN) for Delhi.
+    if has_non_latin:
+        transliterated = _transliterate_location(location)
+        if transliterated and transliterated.lower() != location.lower():
+            retry = _geocode_location(transliterated)
+            if retry:
+                return transliterated, retry
+
+    direct = _geocode_location(location)
+    if direct:
+        return location, direct
+
+    # Latin inputs can still benefit from one normalization retry.
+    transliterated = _transliterate_location(location)
+    if transliterated and transliterated.lower() != location.lower():
+        retry = _geocode_location(transliterated)
+        if retry:
+            return transliterated, retry
+
+    return location, None
+
+
+def _geocode_location(location: str) -> dict | None:
+    geo = requests.get(
+        "https://geocoding-api.open-meteo.com/v1/search",
+        params={"name": location, "count": 8, "language": "en", "format": "json"},
+        timeout=_HTTP_TIMEOUT_SECONDS,
+    )
+    geo.raise_for_status()
+    geo_data = geo.json()
+    results = geo_data.get("results") or []
+    if not results:
+        return None
+
+    # Prefer highest-population match for ambiguous names.
+    def _population(item: dict) -> float:
+        try:
+            return float(item.get("population") or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    return max(results, key=_population)
+
+
+def _transliterate_location(location: str) -> str | None:
+    text = _to_text(location)
+    if not text:
+        return None
+
+    # Skip rewrite for already-Latin inputs.
+    if re.search(r"[A-Za-z]", text) and not re.search(r"[\u0600-\u06FF\u0900-\u097F]", text):
+        return text
+
+    prompt = (
+        "Normalize this city/place name into standard English (Latin script) for geocoding.\n"
+        "Return STRICT JSON only with key 'location'.\n"
+        f"Input: {text}"
+    )
+    try:
+        raw = generate_response(prompt, operation="turn_control")
+        payload = _extract_json_object(raw)
+        if not isinstance(payload, dict):
+            return None
+        candidate = _to_text(payload.get("location"))
+        return candidate
+    except Exception:
+        return None
 
 
 def _fetch_stock_quote(query: str) -> dict[str, Any]:
@@ -248,12 +353,36 @@ def _extract_location(query: str) -> Optional[str]:
     text = (query or "").strip()
     if not text:
         return None
-    match = re.search(r"\b(?:in|at|for)\s+([a-zA-Z][a-zA-Z .-]{1,50})", text, flags=re.IGNORECASE)
-    if not match:
+
+    prompt = (
+        "Extract the weather location from the user message.\n"
+        "Return a location only if user explicitly mentions a city/place/region.\n"
+        "If the user asks generic weather or language preference/style (for example Hindi/English), return null.\n"
+        "If location is missing or unclear, return null.\n\n"
+        f"User message: {text}\n\n"
+        "Return STRICT JSON only with key 'location' (string or null)."
+    )
+
+    try:
+        raw = generate_response(prompt, operation="turn_control")
+        payload = _extract_json_object(raw)
+        if not isinstance(payload, dict):
+            return None
+
+        value = payload.get("location")
+        if value is None:
+            return None
+
+        location = _to_text(value)
+        if not location:
+            return None
+
+        location = re.sub(r"\s+", " ", location).strip(" .,-")
+        if len(location) > 80:
+            location = location[:80].strip()
+        return location or None
+    except Exception:
         return None
-    location = match.group(1).strip(" .,-")
-    location = re.sub(r"\b(today|now|right now|currently|please)\b$", "", location, flags=re.IGNORECASE).strip(" .,-")
-    return location or None
 
 
 def _extract_symbol(query: str) -> Optional[str]:

@@ -7,3 +7,6 @@ finance_project.egg-info/
 .pytest_cache/
 .mypy_cache/
 .vscode/
+finance_project_backup
+OpenAI_rag_New.py
+tests/

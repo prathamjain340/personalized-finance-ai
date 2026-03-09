@@ -53,6 +53,7 @@ class FinanceEngine:
         session_memory_usage: Optional[dict] = None,
         conversation_stage: Optional[ConversationStage] = None,
         response_channel: str = "text",
+        apply_voice_trim: bool = True,
     ):
         # Backward-compatible defaults for older callers (tests/UI).
         if profile is None:
@@ -75,6 +76,7 @@ class FinanceEngine:
                 live_data=live_data,
                 response_channel=response_channel,
                 profile=profile,
+                apply_voice_trim=apply_voice_trim,
             )
             memory_candidates = reflect_on_response(
                 user_id=user_id,
@@ -143,16 +145,13 @@ class FinanceEngine:
                 profile=profile,
                 memories=memories,
             )
-            response = generate_response(
-                prompt,
-                operation="out_of_domain_response",
-                max_tokens_override=self._max_tokens_for_generation(
-                    operation="out_of_domain_response",
-                    response_channel=response_channel,
-                    query=query_for_routing,
-                ),
+            prompt = self._with_language_lock(prompt, query_for_routing)
+            response = generate_response(prompt, operation="out_of_domain_response")
+            response = self._finalize_voice_response(
+                response,
+                response_channel=response_channel,
+                apply_voice_trim=apply_voice_trim,
             )
-            response = self._trim_voice_response(response, response_channel=response_channel)
             memory_candidates = reflect_on_response(
                 user_id=user_id,
                 raw_query=query_for_routing,
@@ -214,16 +213,13 @@ class FinanceEngine:
                 profile=profile,
                 response_channel=response_channel,
             )
-            response = generate_response(
-                prompt,
-                operation="clarification_response",
-                max_tokens_override=self._max_tokens_for_generation(
-                    operation="clarification_response",
-                    response_channel=response_channel,
-                    query=query_for_routing,
-                ),
+            prompt = self._with_language_lock(prompt, query_for_routing)
+            response = generate_response(prompt, operation="clarification_response")
+            response = self._finalize_voice_response(
+                response,
+                response_channel=response_channel,
+                apply_voice_trim=apply_voice_trim,
             )
-            response = self._trim_voice_response(response, response_channel=response_channel)
             log_conversation(
                 user_id=user_id,
                 domain="finance",
@@ -251,18 +247,15 @@ class FinanceEngine:
             pending_field=pending_field,
             response_channel=response_channel,
         )
+        prompt = self._with_language_lock(prompt, query_for_routing)
 
         # 6. Call LLM (stateless reasoning)
-        response = generate_response(
-            prompt,
-            operation="finance_response",
-            max_tokens_override=self._max_tokens_for_generation(
-                operation="finance_response",
-                response_channel=response_channel,
-                query=query_for_routing,
-            ),
+        response = generate_response(prompt, operation="finance_response")
+        response = self._finalize_voice_response(
+            response,
+            response_channel=response_channel,
+            apply_voice_trim=apply_voice_trim,
         )
-        response = self._trim_voice_response(response, response_channel=response_channel)
 
         # 7. Log conversation (immutable)
         log_conversation(
@@ -295,6 +288,49 @@ class FinanceEngine:
         )
 
         return response, memories
+
+    @staticmethod
+    def _extract_current_utterance(raw_query: str) -> str:
+        text = str(raw_query or "").strip()
+        marker = "Current user follow-up:"
+        if marker in text:
+            _, tail = text.rsplit(marker, 1)
+            followup = tail.strip()
+            if followup:
+                return followup
+        return text
+
+    @staticmethod
+    def _preferred_response_language(raw_query: str) -> str:
+        utterance = FinanceEngine._extract_current_utterance(raw_query)
+        # Non-Latin user inputs should get Hindi content in Latin script (Hinglish).
+        if re.search(r"[\u0900-\u097F]", utterance or ""):
+            return "hi"
+        if re.search(r"[\u0600-\u06FF]", utterance or ""):
+            return "hi"
+        if not re.search(r"[A-Za-z]", utterance or ""):
+            return "hi"
+        return "en"
+
+    @staticmethod
+    def _language_lock_instruction(raw_query: str) -> str:
+        language = FinanceEngine._preferred_response_language(raw_query)
+        if language == "hi":
+            return (
+                "LANGUAGE POLICY:\n"
+                "- Reply in Hindi using Latin script only (Hinglish).\n"
+                "- Do not use Devanagari or Urdu/Arabic scripts.\n"
+                "- Keep numbers and tickers in Latin script."
+            )
+        return (
+            "LANGUAGE POLICY:\n"
+            "- Reply only in English using Latin script.\n"
+            "- Do not use Hindi/Devanagari or Urdu/Arabic scripts."
+        )
+
+    @staticmethod
+    def _with_language_lock(prompt: str, raw_query: str) -> str:
+        return f"{prompt}\n\n{FinanceEngine._language_lock_instruction(raw_query)}"
 
     @staticmethod
     def _needs_clarification_first(
@@ -332,33 +368,11 @@ class FinanceEngine:
             return {}
 
     @staticmethod
-    def _max_tokens_for_generation(
-        operation: str,
-        response_channel: str,
-        query: str,
-    ) -> int | None:
-        is_hindi_script = FinanceEngine._contains_devanagari(query)
-        channel = str(response_channel or "text").strip().lower()
-
-        if channel == "voice":
-            if operation == "finance_response":
-                return 220 if is_hindi_script else 170
-            if operation in {"clarification_response", "out_of_domain_response"}:
-                return 140 if is_hindi_script else 110
-            return None
-
-        if operation == "finance_response":
-            return 300 if is_hindi_script else 240
-        if operation in {"clarification_response", "out_of_domain_response"}:
-            return 200 if is_hindi_script else 170
-        return None
-
-    @staticmethod
     def _trim_voice_response(
         text: str,
         response_channel: str,
-        max_words: int = 28,
-        max_sentences: int = 2,
+        max_words: int = 32,
+        max_chars: int = 190,
     ) -> str:
         if response_channel != "voice":
             return text
@@ -367,47 +381,60 @@ class FinanceEngine:
         if not normalized:
             return "Could you please repeat that?"
 
-        # Keep complete sentences only (supports English + Hindi sentence markers).
-        sentences = FinanceEngine._split_sentences(normalized)
+        # Prefer one sentence; optionally include a second only if still compact.
+        sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", normalized) if s.strip()]
         if not sentences:
-            return FinanceEngine._ensure_terminal(normalized)
+            sentences = [normalized]
 
-        # Always keep the first complete sentence, then optionally add one more
-        # if still compact by word count.
-        selected = [sentences[0]]
-        total_words = len(sentences[0].split())
+        selected: list[str] = []
+        word_count = 0
+        for sentence in sentences:
+            words = sentence.split()
+            if not words:
+                continue
 
-        for sentence in sentences[1:max_sentences]:
-            sentence_words = len(sentence.split())
-            if total_words + sentence_words <= max_words:
+            if not selected:
+                if len(words) > max_words:
+                    trimmed = " ".join(words[:max_words])
+                    return FinanceEngine._ensure_terminal(trimmed[:max_chars].rstrip())
                 selected.append(sentence)
-                total_words += sentence_words
-            else:
-                break
+                word_count += len(words)
+                continue
 
-        return FinanceEngine._ensure_terminal(" ".join(selected).strip())
+            candidate = " ".join(selected + [sentence])
+            if len(candidate.split()) <= max_words and len(candidate) <= max_chars:
+                selected.append(sentence)
+                word_count = len(candidate.split())
+            break
 
-    @staticmethod
-    def _split_sentences(text: str) -> list[str]:
-        if not text:
-            return []
-        parts = [p.strip() for p in re.split(r"(?<=[.!?।])\s+", text) if p.strip()]
-        if parts:
-            return [FinanceEngine._ensure_terminal(part) for part in parts]
-        return [FinanceEngine._ensure_terminal(text.strip())]
-
-    @staticmethod
-    def _contains_devanagari(text: str) -> bool:
-        return bool(re.search(r"[\u0900-\u097F]", text or ""))
+        compact = " ".join(selected) if selected else normalized
+        compact_words = compact.split()
+        if len(compact_words) > max_words:
+            compact = " ".join(compact_words[:max_words])
+        if len(compact) > max_chars:
+            compact = compact[:max_chars].rstrip()
+        return FinanceEngine._ensure_terminal(compact)
 
     @staticmethod
     def _ensure_terminal(text: str) -> str:
         if not text:
             return text
-        if text[-1] in ".!?।":
-            return text
-        terminal = "।" if FinanceEngine._contains_devanagari(text) else "."
-        return f"{text}{terminal}"
+        return text if text[-1] in ".!?" else f"{text}."
+
+    @staticmethod
+    def _finalize_voice_response(
+        text: str,
+        response_channel: str,
+        apply_voice_trim: bool,
+    ) -> str:
+        normalized = " ".join((text or "").split()).strip()
+        if response_channel != "voice":
+            return normalized or text
+        if not normalized:
+            return "Could you please repeat that?"
+        if not apply_voice_trim:
+            return normalized
+        return FinanceEngine._trim_voice_response(normalized, response_channel=response_channel)
 
     def _handle_live_data_response(
         self,
@@ -415,12 +442,14 @@ class FinanceEngine:
         live_data: dict,
         response_channel: str,
         profile: dict,
+        apply_voice_trim: bool = True,
     ) -> str:
         status = live_data.get("status")
         if status in {"needs_input", "error", "blocked"}:
-            return self._trim_voice_response(
+            return self._finalize_voice_response(
                 str(live_data.get("message") or "I couldn't fetch that update right now."),
                 response_channel=response_channel,
+                apply_voice_trim=apply_voice_trim,
             )
 
         kind = str(live_data.get("kind") or "").lower()
@@ -436,7 +465,11 @@ class FinanceEngine:
         else:
             response = self._format_generic_live_update(facts=facts, as_of=as_of)
 
-        return self._trim_voice_response(response, response_channel=response_channel)
+        return self._finalize_voice_response(
+            response,
+            response_channel=response_channel,
+            apply_voice_trim=apply_voice_trim,
+        )
 
     @staticmethod
     def _format_weather_update(facts: list[str], as_of: str) -> str:

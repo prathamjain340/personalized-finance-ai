@@ -20,6 +20,8 @@ def _resolve_audio_extension(mime_type: str | None = None, filename: str | None 
     }
 
     mime = str(mime_type or "").strip().lower()
+    if ";" in mime:
+        mime = mime.split(";", 1)[0].strip()
     if mime in known:
         return known[mime]
 
@@ -43,7 +45,7 @@ def speech_to_text(base64_audio: str, mime_type: str | None = None, filename: st
     # Use in-memory buffer instead of temp file
     audio_file = io.BytesIO(audio_bytes)
 
-    # IMPORTANT: give it a filename with appropriate extension
+    # IMPORTANT: give it a filename with correct extension
     extension = _resolve_audio_extension(mime_type=mime_type, filename=filename)
     audio_file.name = f"input.{extension}"
 

@@ -212,12 +212,10 @@ def _response_rules(response_mode: str, response_channel: str = "text") -> str:
     if response_channel == "voice":
         channel_rules = (
             "VOICE RULES:\n"
-            "- Keep it compact and easy to speak\n"
-            "- Use complete sentences only (no sentence fragments)\n"
-            "- Prefer 1 short sentence, max 2\n"
-            "- Target roughly 12-22 words total\n"
-            "- For Hindi/Hinglish, keep language conversational and avoid long list-style narration\n"
-            "- No bullet points"
+            "- Keep it concise and easy to speak\n"
+            "- Use complete thoughts with natural spoken phrasing\n"
+            "- Preserve key facts and numbers even when concise\n"
+            "- Avoid partial lists and avoid bullet points"
         )
     else:
         channel_rules = (
@@ -329,7 +327,7 @@ def assemble_clarification_prompt(
     response_channel: str = "text",
 ) -> str:
     length_rule = (
-        "Respond in 1 concise complete sentence, with one short question only if essential."
+        "Respond briefly in natural spoken style with a complete thought, and ask one focused question only if essential."
         if response_channel == "voice"
         else "Respond in 2-4 short lines."
     )
@@ -360,7 +358,7 @@ def assemble_out_of_domain_prompt(
 
     if small_talk:
         length_rule = (
-            "Reply in one short complete sentence, optionally with a soft bridge to finance."
+            "Reply briefly in natural spoken style, optionally with a soft bridge to finance."
             if response_channel == "voice"
             else "Reply briefly in 1-2 lines, friendly and human."
         )
@@ -377,7 +375,7 @@ def assemble_out_of_domain_prompt(
         )
 
     length_rule = (
-        "Reply in 1 concise complete sentence, max 2 if needed."
+        "Reply briefly in natural spoken style with complete thoughts."
         if response_channel == "voice"
         else "Reply in 2-3 short lines."
     )
@@ -411,8 +409,7 @@ def assemble_live_data_prompt(
 
     if response_channel == "voice":
         length_rule = (
-            "Respond in 1 complete sentence, max 2. Keep it around 12-22 words. "
-            "For Hindi/Hinglish, keep it crisp and conversational. "
+            "Respond in concise spoken style with complete thoughts, preserving key live facts. "
             "No bullet points."
         )
     else:

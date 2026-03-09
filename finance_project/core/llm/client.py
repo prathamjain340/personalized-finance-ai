@@ -20,17 +20,15 @@ _OP_MAX_TOKENS = {
     "clarification_response": 180,
     "finance_response": min(_MAX_TOKENS, 240),
     "live_data_response": 180,
+    "voice_render": min(_MAX_TOKENS, 260),
 }
 _OP_TEMPERATURE = {
     "turn_control": 0.1,
+    "voice_render": 0.2,
 }
 
 
-def generate_response(
-    prompt: str,
-    operation: str = "llm_generation",
-    max_tokens_override: int | None = None,
-) -> str:
+def generate_response(prompt: str, operation: str = "llm_generation") -> str:
     """
     Stateless LLM interface.
 
@@ -41,10 +39,7 @@ def generate_response(
     if not prompt or not prompt.strip():
         raise ValueError("Prompt is empty")
 
-    if isinstance(max_tokens_override, int) and max_tokens_override > 0:
-        max_tokens = max_tokens_override
-    else:
-        max_tokens = _OP_MAX_TOKENS.get(operation, _MAX_TOKENS)
+    max_tokens = _OP_MAX_TOKENS.get(operation, _MAX_TOKENS)
     temperature = _OP_TEMPERATURE.get(operation, _TEMPERATURE)
 
     try:
