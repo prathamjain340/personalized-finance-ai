@@ -2,6 +2,15 @@
 
 Last updated: 2026-03-16
 
+## 2026-03-16 - Baseline Promotion Followed By Variant Cleanup
+- Promoted the validated rebuild baseline into root `finance_project/` and checkpointed on GitHub (`personalized-finance-ai`).
+- After validation, removed side-by-side rollback lanes from workspace: `finance_project_rebuild/` and `finance_project_backup/`.
+- Root workspace is now the single source of truth for ongoing development.
+
+Rationale:
+- Reduce workspace clutter and avoid accidental edits against outdated variants.
+- Keep delivery velocity high by maintaining one canonical path.
+
 ## 2026-03-16 - Profile-First Routing Guardrails
 - Added stronger guardrails in `intent.py` so core profile updates (income/expenses/savings) clear `live_data_kind`.
 - Added fast path for direct profile-answer turns to avoid unnecessary turn-control LLM latency and prevent live-data drift.

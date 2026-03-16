@@ -31,7 +31,7 @@ Last updated: 2026-03-16
 - Prevent wrong live-data jumps when user shares profile values.
 - Reduce voice latency (turn control + response generation + TTS perceived delay).
 
-## Multi-Variant Workspace
-- Current working copy: root project folder.
-- GitHub-base rebuild lane: `finance_project_rebuild` (pinned to `03abff6` and patched for minimal stable core).
-- Other variants used for comparison: `finance_project_github_latest`, `finance_project_backup`.
+## Workspace Baseline
+- Canonical working copy: root project folder (`finance_project/` package within repository root).
+- Side-by-side variant folders were retired after baseline validation on 2026-03-16.
+- Ongoing feature work should be applied only to the root baseline and checkpointed to GitHub.
