@@ -212,10 +212,12 @@ def _response_rules(response_mode: str, response_channel: str = "text") -> str:
     if response_channel == "voice":
         channel_rules = (
             "VOICE RULES:\n"
-            "- Keep it concise and easy to speak\n"
-            "- Use complete thoughts with natural spoken phrasing\n"
-            "- Preserve key facts and numbers even when concise\n"
-            "- Avoid partial lists and avoid bullet points"
+            "- Respond in natural spoken sentences only. No bullets, markdown, or list formatting.\n"
+            "- Use 1 complete sentence for factual answers; up to 2 complete sentences for advice.\n"
+            "- Never output numbered lists in voice mode.\n"
+            "- Preserve key facts and numbers while staying concise.\n"
+            "- If a longer answer is needed, give the top recommendation first and offer details on follow-up.\n"
+            "- Always end on a complete sentence."
         )
     else:
         channel_rules = (
@@ -264,15 +266,12 @@ def _conversation_stage_rules(stage) -> str:
 
 
 def _verbosity_rules(stage) -> str:
-    limits = {
-        "initial_guidance": "Keep it short and clear. One practical step is enough.",
-        "explanation": "Explain simply with one short example only if needed.",
-        "comparison": "Compare options directly and succinctly.",
-        "decision_support": "Be concise and decision-oriented.",
-        "execution_help": "Give practical next steps in minimal words.",
-        "wrap_up": "Keep it very brief.",
-    }
-    return f"LENGTH GUIDANCE:\n- {limits.get(stage, 'Be concise and natural.')}"
+    return (
+        "LENGTH GUIDANCE:\n"
+        "- Factual question: 1-2 complete sentences.\n"
+        "- Advice/planning question: 2-3 complete sentences.\n"
+        "- Do not cut off mid-idea; finish the current thought cleanly."
+    )
 
 
 def _data_completeness_rules(profile_state: Optional[str], missing_fields: List[str]) -> str:
@@ -327,7 +326,7 @@ def assemble_clarification_prompt(
     response_channel: str = "text",
 ) -> str:
     length_rule = (
-        "Respond briefly in natural spoken style with a complete thought, and ask one focused question only if essential."
+        "Respond briefly in natural spoken style with a complete thought, then ask exactly one focused question for the top missing field."
         if response_channel == "voice"
         else "Respond in 2-4 short lines."
     )

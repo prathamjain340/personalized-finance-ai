@@ -15,7 +15,7 @@ _HTTP_TIMEOUT_SECONDS = float(os.getenv("LIVE_DATA_HTTP_TIMEOUT_SECONDS", "4"))
 _MAX_HEADLINES = int(os.getenv("LIVE_DATA_MAX_HEADLINES", "3"))
 
 
-_ALLOWED_LIVE_KINDS = {"weather", "stock", "news"}
+_ALLOWED_LIVE_KINDS = {"weather", "stock", "stock_history", "news"}
 
 
 def _extract_json_object(raw_text: str) -> dict | None:
@@ -48,12 +48,13 @@ def classify_live_data_kind(query: str) -> Optional[str]:
 
     prompt = (
         "You classify whether a user asks for live data updates.\n"
-        "Classify the current message into exactly one kind: weather, stock, news, none.\n"
+        "Classify the current message into exactly one kind: weather, stock, stock_history, news, none.\n"
         "Support multilingual and transliterated input.\n"
         "Choose weather/stock/news only when the user asks for current/live information.\n"
+        "Choose stock_history only when the user asks about historical stock performance over a past period.\n"
         "If the message is educational, conversational, planning, or unclear, choose none.\n\n"
         f"User message: {text}\n\n"
-        "Return STRICT JSON only with key 'kind' and value in [weather, stock, news, none]."
+        "Return STRICT JSON only with key 'kind' and value in [weather, stock, stock_history, news, none]."
     )
 
     try:
@@ -70,12 +71,19 @@ def classify_live_data_kind(query: str) -> Optional[str]:
         return None
 
 
-def maybe_fetch_live_data(query: str, profile: Optional[dict] = None) -> Optional[dict[str, Any]]:
+def maybe_fetch_live_data(
+    query: str,
+    profile: Optional[dict] = None,
+    live_kind: Optional[str] = None,
+    slots: Optional[dict[str, Any]] = None,
+) -> Optional[dict[str, Any]]:
     if not _LIVE_ENABLED:
         return None
 
-    kind = classify_live_data_kind(query)
+    kind = str(live_kind or "").strip().lower() if live_kind else classify_live_data_kind(query)
     if not kind:
+        return None
+    if kind not in _ALLOWED_LIVE_KINDS:
         return None
 
     if _looks_unsafe(query):
@@ -88,17 +96,30 @@ def maybe_fetch_live_data(query: str, profile: Optional[dict] = None) -> Optiona
             "as_of": _now_utc_iso(),
         }
 
+    slots = slots or {}
+
     if kind == "weather":
-        return _fetch_weather(query=query, profile=profile or {})
+        return _fetch_weather(query=query, profile=profile or {}, location_hint=slots.get("location"))
     if kind == "stock":
-        return _fetch_stock_quote(query=query)
+        return _fetch_stock_quote(
+            query=query,
+            symbol_hint=slots.get("ticker"),
+            company_hint=slots.get("company"),
+        )
+    if kind == "stock_history":
+        return _fetch_stock_history(
+            query=query,
+            symbol_hint=slots.get("ticker"),
+            company_hint=slots.get("company"),
+            window_days_hint=slots.get("window_days"),
+        )
     if kind == "news":
-        return _fetch_headlines(query=query)
+        return _fetch_headlines(query=query, topic_hint=slots.get("topic"))
     return None
 
 
-def _fetch_weather(query: str, profile: dict) -> dict[str, Any]:
-    location = _extract_location(query) or _to_text(profile.get("city"))
+def _fetch_weather(query: str, profile: dict, location_hint: Optional[str] = None) -> dict[str, Any]:
+    location = _to_text(location_hint) or _extract_location(query) or _to_text(profile.get("city"))
     if not location:
         return {
             "kind": "weather",
@@ -241,9 +262,13 @@ def _transliterate_location(location: str) -> str | None:
         return None
 
 
-def _fetch_stock_quote(query: str) -> dict[str, Any]:
-    symbol = _extract_symbol(query)
-    company_hint = _extract_company_hint(query)
+def _fetch_stock_quote(
+    query: str,
+    symbol_hint: Optional[str] = None,
+    company_hint: Optional[str] = None,
+) -> dict[str, Any]:
+    symbol = _to_text(symbol_hint) or _extract_symbol(query)
+    company_hint = _to_text(company_hint) or _extract_company_hint(query)
     if not symbol and not company_hint:
         return {
             "kind": "stock",
@@ -296,8 +321,138 @@ def _fetch_stock_quote(query: str) -> dict[str, Any]:
         }
 
 
-def _fetch_headlines(query: str) -> dict[str, Any]:
-    topic = _extract_news_topic(query)
+def _coerce_window_days(value: Any) -> int | None:
+    if value in (None, ""):
+        return None
+    try:
+        days = int(float(value))
+    except (TypeError, ValueError):
+        return None
+    if days < 7 or days > 3650:
+        return None
+    return days
+
+
+def _fetch_stock_history(
+    query: str,
+    symbol_hint: Optional[str] = None,
+    company_hint: Optional[str] = None,
+    window_days_hint: Optional[int] = None,
+) -> dict[str, Any]:
+    symbol = _to_text(symbol_hint) or _extract_symbol(query)
+    company = _to_text(company_hint) or _extract_company_hint(query)
+    if not symbol and not company:
+        return {
+            "kind": "stock_history",
+            "status": "needs_input",
+            "message": "Please share a stock ticker or company name for historical performance (for example, TCS or RELIANCE).",
+            "facts": [],
+            "sources": [],
+            "as_of": _now_utc_iso(),
+        }
+
+    try:
+        nse_symbol = _normalize_nse_symbol(symbol) or _resolve_nse_symbol(company)
+        resolved_symbol = _to_text(symbol) or _resolve_symbol(company)
+        yahoo_symbol = resolved_symbol
+
+        if not yahoo_symbol and nse_symbol:
+            yahoo_symbol = f"{nse_symbol}.NS"
+        elif nse_symbol and yahoo_symbol and "." not in yahoo_symbol and not yahoo_symbol.endswith("NS"):
+            yahoo_symbol = f"{nse_symbol}.NS"
+
+        if not yahoo_symbol:
+            return {
+                "kind": "stock_history",
+                "status": "needs_input",
+                "message": "I couldn't identify that stock. Please share the exact ticker.",
+                "facts": [],
+                "sources": ["https://finance.yahoo.com/"],
+                "as_of": _now_utc_iso(),
+            }
+
+        window_days = _coerce_window_days(window_days_hint) or 1095
+        end_dt = dt.datetime.utcnow()
+        start_dt = end_dt - dt.timedelta(days=window_days)
+
+        history = requests.get(
+            f"https://query1.finance.yahoo.com/v8/finance/chart/{quote_plus(yahoo_symbol)}",
+            params={
+                "interval": "1d",
+                "period1": int(start_dt.timestamp()),
+                "period2": int(end_dt.timestamp()),
+                "events": "history",
+            },
+            timeout=max(6, _HTTP_TIMEOUT_SECONDS),
+        )
+        history.raise_for_status()
+        payload = history.json()
+        result = ((payload or {}).get("chart") or {}).get("result") or []
+        if not result:
+            return {
+                "kind": "stock_history",
+                "status": "needs_input",
+                "message": f"I couldn't fetch historical data for {yahoo_symbol}. Please verify the ticker.",
+                "facts": [],
+                "sources": ["https://finance.yahoo.com/"],
+                "as_of": _now_utc_iso(),
+            }
+
+        quote_data = ((((result[0] or {}).get("indicators") or {}).get("quote")) or [{}])[0]
+        closes = quote_data.get("close") or []
+        series = []
+        for value in closes:
+            try:
+                if value is None:
+                    continue
+                series.append(float(value))
+            except (TypeError, ValueError):
+                continue
+
+        if len(series) < 2:
+            return {
+                "kind": "stock_history",
+                "status": "needs_input",
+                "message": f"I couldn't fetch enough historical points for {yahoo_symbol}. Try another ticker or range.",
+                "facts": [],
+                "sources": ["https://finance.yahoo.com/"],
+                "as_of": _now_utc_iso(),
+            }
+
+        start_price = series[0]
+        end_price = series[-1]
+        total_return = ((end_price - start_price) / start_price) * 100 if start_price else 0.0
+        meta = result[0].get("meta") or {}
+        instrument = _to_text(meta.get("symbol")) or yahoo_symbol
+
+        facts = [
+            f"Instrument: {instrument}",
+            f"Period: {start_dt.date().isoformat()} to {end_dt.date().isoformat()}",
+            f"Start price: {round(start_price, 2)}",
+            f"End price: {round(end_price, 2)}",
+            f"Total return: {round(total_return, 2)}%",
+        ]
+        return {
+            "kind": "stock_history",
+            "status": "ok",
+            "message": None,
+            "facts": facts,
+            "sources": ["https://finance.yahoo.com/"],
+            "as_of": _now_utc_iso(),
+        }
+    except Exception:
+        return {
+            "kind": "stock_history",
+            "status": "error",
+            "message": "I couldn't fetch historical stock data right now. Please try again shortly.",
+            "facts": [],
+            "sources": ["https://finance.yahoo.com/"],
+            "as_of": _now_utc_iso(),
+        }
+
+
+def _fetch_headlines(query: str, topic_hint: Optional[str] = None) -> dict[str, Any]:
+    topic = _to_text(topic_hint) or _extract_news_topic(query)
     if not topic:
         topic = "india finance"
 

@@ -14,16 +14,33 @@ _TEMPERATURE = float(os.getenv("OPENAI_TEMPERATURE", "0.3"))
 _MAX_TOKENS = int(os.getenv("OPENAI_MAX_TOKENS", "500"))
 _TIMEOUT_SECONDS = float(os.getenv("OPENAI_TIMEOUT_SECONDS", "15"))
 
+
+def _token_budget(env_key: str, default_value: int) -> int:
+    raw_value = os.getenv(env_key, str(default_value))
+    try:
+        parsed = int(raw_value)
+    except (TypeError, ValueError):
+        parsed = default_value
+    return min(_MAX_TOKENS, max(64, parsed))
+
+
+_FINANCE_RESPONSE_MAX_TOKENS = _token_budget("OPENAI_FINANCE_RESPONSE_MAX_TOKENS", 320)
+_FINANCE_VOICE_MAX_TOKENS = _token_budget("OPENAI_FINANCE_VOICE_MAX_TOKENS", 180)
+_CLARIFICATION_MAX_TOKENS = _token_budget("OPENAI_CLARIFICATION_MAX_TOKENS", 220)
+_TURN_CONTROL_MAX_TOKENS = _token_budget("OPENAI_TURN_CONTROL_MAX_TOKENS", 192)
+
 _OP_MAX_TOKENS = {
-    "turn_control": 160,
+    "turn_control": _TURN_CONTROL_MAX_TOKENS,
     "out_of_domain_response": 180,
-    "clarification_response": 180,
-    "finance_response": min(_MAX_TOKENS, 240),
+    "clarification_response": _CLARIFICATION_MAX_TOKENS,
+    "finance_response": _FINANCE_RESPONSE_MAX_TOKENS,
+    "finance_response_voice": _FINANCE_VOICE_MAX_TOKENS,
     "live_data_response": 180,
     "voice_render": min(_MAX_TOKENS, 260),
 }
 _OP_TEMPERATURE = {
     "turn_control": 0.1,
+    "finance_response_voice": 0.25,
     "voice_render": 0.2,
 }
 

@@ -20,13 +20,15 @@ ALLOWED_FINANCIAL_CATEGORIES = {
     "savings_lookup",
     "general",
 }
-ALLOWED_PENDING_FIELDS = {"monthly_income", "monthly_expenses", "monthly_savings"}
+ALLOWED_PENDING_FIELDS = {"monthly_income", "monthly_expenses", "monthly_savings", "existing_investments"}
 ALLOWED_QUESTION_SCOPES = {"general", "profile_specific", "hybrid"}
+ALLOWED_LIVE_DATA_KINDS = {"weather", "stock", "stock_history", "news"}
 
 PROFILE_UPDATE_FIELD_TYPES = {
     "monthly_income": "number",
     "monthly_expenses": "number",
     "monthly_savings": "number",
+    "existing_investments": "text",
     "full_name": "text",
     "preferred_name": "text",
     "occupation": "text",
@@ -55,6 +57,8 @@ class TurnControl:
     pending_field: str | None
     question_scope: str
     self_knowledge_request: bool
+    live_data_kind: str | None
+    live_data_slots: dict[str, Any]
 
 
 DEFAULT_ROUTING = QueryRouting(
@@ -71,6 +75,8 @@ DEFAULT_TURN_CONTROL = TurnControl(
     pending_field=None,
     question_scope="general",
     self_knowledge_request=False,
+    live_data_kind=None,
+    live_data_slots={},
 )
 
 
@@ -140,20 +146,28 @@ def _sanitize_question_scope(value) -> str:
 
 
 def _infer_scope_heuristic(query: str) -> str:
-    text = (query or "").strip().lower()
-    if not text:
-        return "general"
-
-    personal_markers = {" my ", " me ", " for me", " can i ", " should i ", " afford ", " according to my "}
-    has_personal = any(marker in f" {text} " for marker in personal_markers) or text.startswith("my ")
-    has_general = any(
-        phrase in text for phrase in ("what is", "how does", "explain", "difference between", "meaning of", "define")
-    )
-    if has_personal and has_general:
-        return "hybrid"
-    if has_personal:
-        return "profile_specific"
     return "general"
+
+
+def _sanitize_live_data_kind(value) -> str | None:
+    kind = str(value or "").strip().lower()
+    if kind in {"", "none", "null"}:
+        return None
+    if kind not in ALLOWED_LIVE_DATA_KINDS:
+        return None
+    return kind
+
+
+def _to_window_days(value) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        days = int(float(value))
+    except (TypeError, ValueError):
+        return None
+    if days < 7 or days > 3650:
+        return None
+    return days
 
 
 def _extract_json_payload(raw_text: str) -> dict | None:
@@ -199,11 +213,18 @@ def _build_turn_control_prompt(
         "- financial_category: one of [affordability, investment_advice, insurance_planning, debt_management, income_lookup, expense_lookup, savings_lookup, general]\n"
         "- question_scope: one of [general, profile_specific, hybrid]\n"
         "- self_knowledge_request: boolean\n"
-        "- profile_updates: object with zero or more keys [monthly_income, monthly_expenses, monthly_savings, full_name, preferred_name, occupation, city, relationship_status, preferred_language]\n"
+        "- live_data_kind: one of [weather, stock, stock_history, news, none]\n"
+        "- live_ticker: string or null\n"
+        "- live_company: string or null\n"
+        "- live_location: string or null\n"
+        "- live_topic: string or null\n"
+        "- live_window_days: integer days or null\n"
+        "- profile_updates: object with zero or more keys [monthly_income, monthly_expenses, monthly_savings, existing_investments, full_name, preferred_name, occupation, city, relationship_status, preferred_language]\n"
         "  - For monthly_* fields, values must be integer INR monthly amounts\n"
+        "  - If user explicitly says they currently have no investments, set existing_investments to 'none_declared'\n"
         "  - For personal fields, values should be short strings\n"
         "- active_goal: short string or null\n"
-        "- pending_field: one of [monthly_income, monthly_expenses, monthly_savings, none]\n\n"
+        "- pending_field: one of [monthly_income, monthly_expenses, monthly_savings, existing_investments, none]\n\n"
         "Guidance:\n"
         "- small_talk=true ONLY for pure social niceties without an informational request.\n"
         "- Keep the assistant finance-anchored but conversationally soft.\n"
@@ -220,6 +241,10 @@ def _build_turn_control_prompt(
         "- Definitions inside finance (e.g., what is savings account) use financial_category=general.\n"
         "- Extract multiple profile fields if user provides them in one message.\n"
         "- If any update is unclear, leave that field out.\n"
+        "- Set live_data_kind only when user explicitly asks for current or historical data updates.\n"
+        "- For stock-history performance questions use stock_history and fill live_window_days when available.\n"
+        "- Use live slots only when explicitly present in the user turn.\n"
+        "- If the user is answering a profile question with financial amounts, live_data_kind must be none.\n"
         "- Keep active_goal stable unless user clearly switches topics.\n"
         "- If user still needs to answer a missing detail, set pending_field accordingly; otherwise pending_field=none.\n"
         "- If uncertain, choose finance_query=true, small_talk=false, intent=general, financial_category=general.\n"
@@ -240,8 +265,10 @@ def infer_turn_control(
             profile_updates={},
             active_goal=active_goal,
             pending_field=pending_field,
-            question_scope=_infer_scope_heuristic(query),
+            question_scope="general",
             self_knowledge_request=False,
+            live_data_kind=None,
+            live_data_slots={},
         )
 
     prompt = _build_turn_control_prompt(
@@ -259,8 +286,10 @@ def infer_turn_control(
             profile_updates={},
             active_goal=active_goal,
             pending_field=pending_field,
-            question_scope=_infer_scope_heuristic(query),
+            question_scope="general",
             self_knowledge_request=False,
+            live_data_kind=None,
+            live_data_slots={},
         )
 
     finance_query = _to_bool(payload.get("finance_query"), default=True)
@@ -298,10 +327,19 @@ def infer_turn_control(
     next_active_goal = _sanitize_active_goal(payload.get("active_goal"))
     next_pending_field = _sanitize_pending_field(payload.get("pending_field"))
     question_scope = _sanitize_question_scope(payload.get("question_scope"))
-    heuristic_scope = _infer_scope_heuristic(query)
-    if question_scope == "general" and heuristic_scope != "general":
-        question_scope = heuristic_scope
     self_knowledge_request = _to_bool(payload.get("self_knowledge_request"), default=False)
+    live_data_kind = _sanitize_live_data_kind(payload.get("live_data_kind"))
+    live_data_slots = {
+        "ticker": _to_text_value(payload.get("live_ticker")),
+        "company": _to_text_value(payload.get("live_company")),
+        "location": _to_text_value(payload.get("live_location")),
+        "topic": _to_text_value(payload.get("live_topic")),
+        "window_days": _to_window_days(payload.get("live_window_days")),
+    }
+
+    if any(field in profile_updates for field in ("monthly_income", "monthly_expenses", "monthly_savings", "existing_investments")):
+        live_data_kind = None
+        live_data_slots = {}
 
     if small_talk:
         finance_query = False
@@ -318,6 +356,8 @@ def infer_turn_control(
         pending_field=next_pending_field,
         question_scope=question_scope,
         self_knowledge_request=self_knowledge_request,
+        live_data_kind=live_data_kind,
+        live_data_slots=live_data_slots,
     )
 
 
