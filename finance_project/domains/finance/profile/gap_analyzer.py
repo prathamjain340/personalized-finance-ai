@@ -13,7 +13,7 @@ class ProfileDataState(str, Enum):
 # Which profile fields matter for which question types
 INTENT_REQUIREMENTS = {
     "affordability": ["monthly_income", "monthly_expenses", "monthly_savings"],
-    "investment_advice": ["monthly_income", "monthly_savings"],
+    "investment_advice": ["monthly_income", "monthly_expenses", "monthly_savings", "existing_investments"],
     "insurance_planning": ["monthly_income", "dependents"],
     "debt_management": ["monthly_income", "monthly_expenses"],
     "income_lookup": ["monthly_income"],
@@ -76,6 +76,7 @@ def analyze_profile_gaps(
         "monthly_expenses": _is_positive_number,
         "monthly_savings": _is_positive_number,
         "dependents": _is_non_negative_number,
+        "existing_investments": _is_present,
     }
 
     missing = []

@@ -54,6 +54,9 @@ class FinanceEngine:
         conversation_stage: Optional[ConversationStage] = None,
         response_channel: str = "text",
         apply_voice_trim: bool = True,
+        live_data_kind: Optional[str] = None,
+        live_data_slots: Optional[dict] = None,
+        enable_live_data: bool = True,
     ):
         # Backward-compatible defaults for older callers (tests/UI).
         if profile is None:
@@ -69,7 +72,14 @@ class FinanceEngine:
 
         query_for_routing = current_query or raw_query
 
-        live_data = maybe_fetch_live_data(query=query_for_routing, profile=profile)
+        live_data = None
+        if enable_live_data:
+            live_data = maybe_fetch_live_data(
+                query=query_for_routing,
+                profile=profile,
+                live_kind=live_data_kind,
+                slots=live_data_slots,
+            )
         if live_data:
             response = self._handle_live_data_response(
                 query=query_for_routing,
@@ -180,6 +190,8 @@ class FinanceEngine:
 
         # Check profile sufficiency
         profile_state, missing_fields = analyze_profile_gaps(financial_category, profile)
+        if pending_field and pending_field in missing_fields:
+            missing_fields = [pending_field]
 
         signals = self._safe_compute_signals(profile)
 
@@ -201,7 +213,8 @@ class FinanceEngine:
             memories=memories,
         )
 
-        if self._needs_clarification_first(
+        force_pending_clarification = bool(pending_field and pending_field in missing_fields)
+        if force_pending_clarification or self._needs_clarification_first(
             intent=intent,
             financial_category=financial_category,
             profile_state=profile_state,
@@ -250,7 +263,8 @@ class FinanceEngine:
         prompt = self._with_language_lock(prompt, query_for_routing)
 
         # 6. Call LLM (stateless reasoning)
-        response = generate_response(prompt, operation="finance_response")
+        finance_operation = "finance_response_voice" if response_channel == "voice" else "finance_response"
+        response = generate_response(prompt, operation=finance_operation)
         response = self._finalize_voice_response(
             response,
             response_channel=response_channel,
@@ -460,6 +474,8 @@ class FinanceEngine:
             response = self._format_weather_update(facts=facts, as_of=as_of)
         elif kind == "stock":
             response = self._format_stock_update(facts=facts, as_of=as_of)
+        elif kind == "stock_history":
+            response = self._format_stock_history_update(facts=facts, as_of=as_of)
         elif kind == "news":
             response = self._format_news_update(facts=facts, as_of=as_of)
         else:
@@ -508,6 +524,29 @@ class FinanceEngine:
             parts.append(f"change is {change}")
 
         body = ", ".join(parts) if parts else "Here is the latest stock update."
+        freshness = FinanceEngine._freshness_suffix(as_of)
+        caution = " This is market data, not a buy or sell recommendation."
+        return f"{body}.{freshness}{caution}"
+
+    @staticmethod
+    def _format_stock_history_update(facts: list[str], as_of: str) -> str:
+        instrument = FinanceEngine._first_fact_value(facts, "Instrument:")
+        period = FinanceEngine._first_fact_value(facts, "Period:")
+        start_price = FinanceEngine._first_fact_value(facts, "Start price:")
+        end_price = FinanceEngine._first_fact_value(facts, "End price:")
+        total_return = FinanceEngine._first_fact_value(facts, "Total return:")
+
+        parts = []
+        if instrument:
+            parts.append(f"{instrument}")
+        if period:
+            parts.append(f"period is {period}")
+        if start_price and end_price:
+            parts.append(f"start price {start_price}, end price {end_price}")
+        if total_return:
+            parts.append(f"total return {total_return}")
+
+        body = ", ".join(parts) if parts else "Here is the historical stock performance."
         freshness = FinanceEngine._freshness_suffix(as_of)
         caution = " This is market data, not a buy or sell recommendation."
         return f"{body}.{freshness}{caution}"

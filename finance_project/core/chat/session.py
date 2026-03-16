@@ -20,6 +20,8 @@ class ChatSession:
         self.recent_turns: list[tuple[str, str]] = []
         self.active_goal: Optional[str] = None
         self.pending_field: Optional[str] = None
+        self.profile_collection_goal: Optional[str] = None
+        self.profile_collection_queue: list[str] = []
         self.stage: ConversationStage = ConversationStage.INITIAL
         self.has_started = False
 
@@ -38,6 +40,8 @@ class ChatSession:
             "Session state:",
             f"Active goal: {self.active_goal or 'none'}",
             f"Pending field: {self.pending_field or 'none'}",
+            f"Profile collection goal: {self.profile_collection_goal or 'none'}",
+            f"Profile collection queue: {', '.join(self.profile_collection_queue) if self.profile_collection_queue else 'none'}",
             "",
             "Recent conversation turns:",
         ]
