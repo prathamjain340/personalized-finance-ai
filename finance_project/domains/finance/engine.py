@@ -17,6 +17,7 @@ from finance_project.domains.finance.prompt.assembler import (
 from finance_project.domains.finance.reflection import reflect_on_response
 
 from finance_project.core.summary.repository import get_domain_summary
+from finance_project.core.profile.repository import get_profile, merge_profiles
 from finance_project.core.memory.retriever import retrieve_memories
 from finance_project.core.llm.client import generate_response
 from finance_project.core.logging.logger import log_conversation
@@ -108,6 +109,11 @@ class FinanceEngine:
                     "intent": "live_data",
                     "live_kind": live_data.get("kind"),
                     "live_status": live_data.get("status"),
+                    "live_route": live_data.get("route", "structured"),
+                    "live_provider": live_data.get("provider", "unknown"),
+                    "ambiguity_clarification": bool(live_data.get("ambiguity_clarification")),
+                    "live_failure_reason": live_data.get("failure_reason"),
+                    "provider_attempts_count": len(live_data.get("provider_attempts") or []),
                 },
             )
             return response, []
@@ -126,8 +132,12 @@ class FinanceEngine:
                 session_memory_usage=session_memory_usage,
                 limit=8,
             )
+            profile_snapshot = self._refresh_profile_snapshot(
+                user_id=user_id,
+                in_session_profile=profile,
+            )
             response = self._build_self_knowledge_response(
-                profile=profile,
+                profile=profile_snapshot,
                 memories=memories,
                 response_channel=response_channel,
             )
@@ -136,7 +146,11 @@ class FinanceEngine:
                 domain="finance",
                 request=raw_query,
                 response=response,
-                metadata={"intent": "self_knowledge"},
+                metadata={
+                    "intent": "self_knowledge",
+                    "profile_fields_count": self._non_empty_profile_fields_count(profile_snapshot),
+                    "memory_count": len(memories),
+                },
             )
             return response, memories
 
@@ -476,6 +490,14 @@ class FinanceEngine:
             response = self._format_stock_update(facts=facts, as_of=as_of)
         elif kind == "stock_history":
             response = self._format_stock_history_update(facts=facts, as_of=as_of)
+        elif kind == "crypto":
+            response = self._format_crypto_update(facts=facts, as_of=as_of)
+        elif kind == "crypto_history":
+            response = self._format_crypto_history_update(facts=facts, as_of=as_of)
+        elif kind == "gold":
+            response = self._format_gold_update(facts=facts, as_of=as_of)
+        elif kind == "fx":
+            response = self._format_fx_update(facts=facts, as_of=as_of)
         elif kind == "news":
             response = self._format_news_update(facts=facts, as_of=as_of)
         else:
@@ -547,6 +569,89 @@ class FinanceEngine:
             parts.append(f"total return {total_return}")
 
         body = ", ".join(parts) if parts else "Here is the historical stock performance."
+        freshness = FinanceEngine._freshness_suffix(as_of)
+        caution = " This is market data, not a buy or sell recommendation."
+        return f"{body}.{freshness}{caution}"
+
+    @staticmethod
+    def _format_crypto_update(facts: list[str], as_of: str) -> str:
+        instrument = FinanceEngine._first_fact_value(facts, "Instrument:")
+        usd_price = FinanceEngine._first_fact_value(facts, "Last price:")
+        inr_price = FinanceEngine._first_fact_value(facts, "Last price INR:")
+        day_change = FinanceEngine._first_fact_value(facts, "24h change:")
+
+        parts = []
+        if instrument:
+            parts.append(instrument)
+        if usd_price:
+            parts.append(f"price is {usd_price}")
+        if inr_price:
+            parts.append(f"inr price is {inr_price}")
+        if day_change:
+            parts.append(f"24 hour change is {day_change}")
+
+        body = ", ".join(parts) if parts else "Here is the latest crypto update."
+        freshness = FinanceEngine._freshness_suffix(as_of)
+        caution = " This is market data, not a buy or sell recommendation."
+        return f"{body}.{freshness}{caution}"
+
+    @staticmethod
+    def _format_crypto_history_update(facts: list[str], as_of: str) -> str:
+        instrument = FinanceEngine._first_fact_value(facts, "Instrument:")
+        period = FinanceEngine._first_fact_value(facts, "Period:")
+        start_price = FinanceEngine._first_fact_value(facts, "Start price:")
+        end_price = FinanceEngine._first_fact_value(facts, "End price:")
+        total_return = FinanceEngine._first_fact_value(facts, "Total return:")
+
+        parts = []
+        if instrument:
+            parts.append(instrument)
+        if period:
+            parts.append(f"period is {period}")
+        if start_price and end_price:
+            parts.append(f"start price {start_price}, end price {end_price}")
+        if total_return:
+            parts.append(f"total return {total_return}")
+
+        body = ", ".join(parts) if parts else "Here is the historical crypto performance."
+        freshness = FinanceEngine._freshness_suffix(as_of)
+        caution = " This is market data, not a buy or sell recommendation."
+        return f"{body}.{freshness}{caution}"
+
+    @staticmethod
+    def _format_gold_update(facts: list[str], as_of: str) -> str:
+        instrument = FinanceEngine._first_fact_value(facts, "Instrument:")
+        price = FinanceEngine._first_fact_value(facts, "Last price:")
+        change = FinanceEngine._first_fact_value(facts, "Change:")
+
+        parts = []
+        if instrument:
+            parts.append(instrument)
+        if price:
+            parts.append(f"price is {price}")
+        if change:
+            parts.append(f"change is {change}")
+
+        body = ", ".join(parts) if parts else "Here is the latest gold update."
+        freshness = FinanceEngine._freshness_suffix(as_of)
+        caution = " This is market data, not a buy or sell recommendation."
+        return f"{body}.{freshness}{caution}"
+
+    @staticmethod
+    def _format_fx_update(facts: list[str], as_of: str) -> str:
+        pair = FinanceEngine._first_fact_value(facts, "Pair:")
+        rate = FinanceEngine._first_fact_value(facts, "Rate:")
+        date = FinanceEngine._first_fact_value(facts, "Date:")
+
+        parts = []
+        if pair:
+            parts.append(f"for {pair}")
+        if rate:
+            parts.append(rate)
+        if date:
+            parts.append(f"dated {date}")
+
+        body = ", ".join(parts) if parts else "Here is the latest forex update."
         freshness = FinanceEngine._freshness_suffix(as_of)
         caution = " This is market data, not a buy or sell recommendation."
         return f"{body}.{freshness}{caution}"
@@ -647,6 +752,27 @@ class FinanceEngine:
         return [item["line"] for item in compact[:limit]]
 
     @staticmethod
+    def _refresh_profile_snapshot(user_id: str, in_session_profile: dict | None) -> dict:
+        session_profile = dict(in_session_profile or {})
+        try:
+            persisted = get_profile(user_id)
+            return merge_profiles(persisted, session_profile)
+        except Exception:
+            return session_profile
+
+    @staticmethod
+    def _non_empty_profile_fields_count(profile: dict | None) -> int:
+        data = dict(profile or {})
+        count = 0
+        for value in data.values():
+            if value is None:
+                continue
+            if isinstance(value, str) and not value.strip():
+                continue
+            count += 1
+        return count
+
+    @staticmethod
     def _build_self_knowledge_response(profile: dict, memories: list, response_channel: str) -> str:
         points: list[str] = []
         name = profile.get("preferred_name") or profile.get("full_name") or profile.get("name")
@@ -676,8 +802,16 @@ class FinanceEngine:
                 summary_bits.append(f"your name is {name}")
             if city:
                 summary_bits.append(f"you are in {city}")
+            if income not in (None, ""):
+                summary_bits.append(f"your monthly income is INR {income}")
+            if expenses not in (None, ""):
+                summary_bits.append(f"your monthly expenses are INR {expenses}")
+            if savings not in (None, ""):
+                summary_bits.append(f"your monthly savings are INR {savings}")
             if memory_lines:
                 summary_bits.append(memory_lines[0].rstrip("."))
+            if not summary_bits:
+                return "I only know limited details so far. You can share your preferences and I'll remember them."
             return "I know that " + ", and ".join(summary_bits) + "."
 
         lines = ["Here is what I currently know about you:"]

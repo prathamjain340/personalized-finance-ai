@@ -22,7 +22,16 @@ ALLOWED_FINANCIAL_CATEGORIES = {
 }
 ALLOWED_PENDING_FIELDS = {"monthly_income", "monthly_expenses", "monthly_savings", "existing_investments"}
 ALLOWED_QUESTION_SCOPES = {"general", "profile_specific", "hybrid"}
-ALLOWED_LIVE_DATA_KINDS = {"weather", "stock", "stock_history", "news"}
+ALLOWED_LIVE_DATA_KINDS = {
+    "weather",
+    "stock",
+    "stock_history",
+    "news",
+    "crypto",
+    "crypto_history",
+    "gold",
+    "fx",
+}
 
 PROFILE_UPDATE_FIELD_TYPES = {
     "monthly_income": "number",
@@ -213,9 +222,13 @@ def _build_turn_control_prompt(
         "- financial_category: one of [affordability, investment_advice, insurance_planning, debt_management, income_lookup, expense_lookup, savings_lookup, general]\n"
         "- question_scope: one of [general, profile_specific, hybrid]\n"
         "- self_knowledge_request: boolean\n"
-        "- live_data_kind: one of [weather, stock, stock_history, news, none]\n"
+        "- live_data_kind: one of [weather, stock, stock_history, news, crypto, crypto_history, gold, fx, none]\n"
         "- live_ticker: string or null\n"
         "- live_company: string or null\n"
+        "- live_coin: string or null\n"
+        "- live_pair: string like USD/INR or null\n"
+        "- live_base_currency: 3-letter code or null\n"
+        "- live_quote_currency: 3-letter code or null\n"
         "- live_location: string or null\n"
         "- live_topic: string or null\n"
         "- live_window_days: integer days or null\n"
@@ -243,6 +256,9 @@ def _build_turn_control_prompt(
         "- If any update is unclear, leave that field out.\n"
         "- Set live_data_kind only when user explicitly asks for current or historical data updates.\n"
         "- For stock-history performance questions use stock_history and fill live_window_days when available.\n"
+        "- For crypto historical performance questions use crypto_history and fill live_window_days when available.\n"
+        "- For fx queries populate pair and/or base_currency + quote_currency when possible.\n"
+        "- For crypto queries populate live_coin when available.\n"
         "- Use live slots only when explicitly present in the user turn.\n"
         "- If the user is answering a profile question with financial amounts, live_data_kind must be none.\n"
         "- Keep active_goal stable unless user clearly switches topics.\n"
@@ -332,6 +348,10 @@ def infer_turn_control(
     live_data_slots = {
         "ticker": _to_text_value(payload.get("live_ticker")),
         "company": _to_text_value(payload.get("live_company")),
+        "coin": _to_text_value(payload.get("live_coin")),
+        "pair": _to_text_value(payload.get("live_pair")),
+        "base_currency": _to_text_value(payload.get("live_base_currency")),
+        "quote_currency": _to_text_value(payload.get("live_quote_currency")),
         "location": _to_text_value(payload.get("live_location")),
         "topic": _to_text_value(payload.get("live_topic")),
         "window_days": _to_window_days(payload.get("live_window_days")),

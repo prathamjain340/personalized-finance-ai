@@ -1,6 +1,6 @@
 # User And Project Snapshot
 
-Last updated: 2026-03-16
+Last updated: 2026-03-17
 
 ## Project Purpose
 - Voice-first personal finance assistant API.
@@ -29,7 +29,8 @@ Last updated: 2026-03-16
 ## Current Focus
 - Improve profile-first personalization (income, expenses, savings, investments).
 - Prevent wrong live-data jumps when user shares profile values.
-- Reduce voice latency (turn control + response generation + TTS perceived delay).
+- Keep high answer quality while expanding live coverage through hybrid routing.
+- Improve live-data reliability consistency (especially history/gold paths) with generalized provider-chain fallback.
 
 ## Workspace Baseline
 - Canonical working copy: root project folder (`finance_project/` package within repository root).

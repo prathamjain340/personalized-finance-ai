@@ -99,7 +99,16 @@ def _context_window_for_scope(scope: str | None, response_channel: str) -> int:
 
 def _has_concrete_live_slot(turn_control: TurnControl) -> bool:
     slots = turn_control.live_data_slots or {}
-    return bool(slots.get("ticker") or slots.get("company") or slots.get("location") or slots.get("topic"))
+    return bool(
+        slots.get("ticker")
+        or slots.get("company")
+        or slots.get("coin")
+        or slots.get("pair")
+        or slots.get("base_currency")
+        or slots.get("quote_currency")
+        or slots.get("location")
+        or slots.get("topic")
+    )
 
 
 def _should_rewrite_live_followup(turn_control: TurnControl) -> bool:
@@ -111,6 +120,13 @@ def _should_rewrite_live_followup(turn_control: TurnControl) -> bool:
     if kind in {"stock", "stock_history"}:
         slots = turn_control.live_data_slots or {}
         return not (slots.get("ticker") or slots.get("company"))
+    if kind in {"crypto", "crypto_history"}:
+        return not (turn_control.live_data_slots or {}).get("coin")
+    if kind == "fx":
+        slots = turn_control.live_data_slots or {}
+        return not (slots.get("pair") or (slots.get("base_currency") and slots.get("quote_currency")))
+    if kind == "gold":
+        return False
     return False
 
 
@@ -129,6 +145,14 @@ def _rewrite_live_followup_query(user_message: str, turn_control: TurnControl) -
         return f"stock price of {message}"
     if kind == "stock_history":
         return f"stock history of {message}"
+    if kind == "crypto":
+        return f"crypto price of {message}"
+    if kind == "crypto_history":
+        return f"crypto history of {message}"
+    if kind == "fx":
+        return f"forex rate for {message}"
+    if kind == "gold":
+        return f"gold price update for {message}"
     return message
 
 

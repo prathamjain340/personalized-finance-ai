@@ -9,6 +9,7 @@ Last updated: 2026-03-16
 - Prioritize complete, high-quality voice answers over aggressive latency trimming.
 - Keep voice answers concise but fully finished (no cutoff or mid-sentence truncation).
 - Avoid hardcoded keyword-only routing/matching; prefer model/context-driven and language-agnostic logic.
+- Prefer hybrid live-data architecture: structured providers first, generalized web fallback for unsupported/failing live asks.
 
 ## Testing Workflow Preferences
 - Compare multiple app variants in Voice Lab side-by-side before merging features.

@@ -1,6 +1,35 @@
 # Technical Decisions Log
 
-Last updated: 2026-03-16
+Last updated: 2026-03-17
+
+## 2026-03-17 - Generalized Live Provider Chain + Reliability Gates
+- Replaced direct per-kind live fetch branching with a generalized provider-chain registry for all live kinds.
+- Added chain-level telemetry (`provider_attempts`, `failure_reason`) and standardized fallback outcomes (`fallback_ok`, `fallback_empty`, `provider_failed`).
+- Added secondary structured providers for reliability where available (for example stock-history via stooq history and gold via stooq quote) through the same shared orchestrator.
+- Fixed stock-history exchange coercion so non-Indian symbols are no longer auto-forced to `.NS`.
+- Broadened FX pair parsing to detect `USD/INR`, `USD-INR`, `USD to INR`, and compact `USDINR` inside natural sentences without keyword-only routing.
+
+Rationale:
+- Keep fallback behavior non-hardcoded and reusable across all live kinds.
+- Improve live-data reliability without adding keyword-only routing rules.
+
+## 2026-03-17 - Self-Knowledge Profile Snapshot Fix
+- Self-knowledge responses now merge persisted profile with in-session profile before rendering.
+- Voice self-knowledge formatter now includes financial profile facts and avoids empty shell output (`I know that .`).
+- Added self-knowledge observability fields (`profile_fields_count`, `memory_count`) in conversation metadata.
+
+Rationale:
+- Logs showed profile data was stored but self-knowledge responses sometimes rendered blank.
+
+## 2026-03-16 - Hybrid Live-Data Router (Structured + Web Fallback)
+- Expanded `live_data_kind` to include `crypto`, `crypto_history`, `gold`, and `fx` while retaining `weather`, `stock`, `stock_history`, and `news`.
+- Kept deterministic structured providers for numeric facts (weather/equities/crypto/gold/fx) and enabled generalized web-search fallback.
+- Set news flow to web-first with RSS fallback, then generic web fallback when needed.
+- Added one-step ambiguity clarification for symbol/coin resolution and route observability metadata (`route`, `provider`, `ambiguity_clarification`).
+
+Rationale:
+- Preserve accuracy for real-time numeric data while increasing coverage for open-ended live updates.
+- Keep routing model/context-driven and avoid hardcoded keyword-only behavior.
 
 ## 2026-03-16 - Baseline Promotion Followed By Variant Cleanup
 - Promoted the validated rebuild baseline into root `finance_project/` and checkpointed on GitHub (`personalized-finance-ai`).
