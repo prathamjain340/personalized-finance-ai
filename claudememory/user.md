@@ -1,6 +1,6 @@
 # User And Project Snapshot
 
-Last updated: 2026-03-17
+Last updated: 2026-03-20
 
 ## Project Purpose
 - Voice-first personal finance assistant API.
@@ -28,11 +28,25 @@ Last updated: 2026-03-17
 - `finance_project/services/memory_extraction_service.py`: LLM-based durable memory extraction.
 
 ## Current Focus
-- Improve profile-first personalization (income, expenses, savings, investments).
-- Prevent wrong live-data jumps when user shares profile values.
-- Keep high answer quality while expanding live coverage through hybrid routing.
-- Commodity prices (silver, oil, etc.) now route to `commodity` live_data_kind → web fallback for accurate live data.
-- Stock/history equity resolution failures now fall through to web fallback instead of dead-ending.
+- Response naturalness for voice: shorter responses, no tickers/ISO timestamps in output, INR prices.
+- MF knowledge injection working via `knowledge.py` distilled block.
+- Pending: NISM Series V exam content, Indian MF NAV live data.
+
+## Live Data Kinds (working as of 2026-03-20)
+- weather, stock, stock_history, crypto, crypto_history, gold, gold_history, commodity, commodity_history, fx, news
+- All prices converted to INR where applicable.
+- Commodity/precious metal spot prices use LLM-extracted stooq ticker (e.g. XAGUSD for silver).
+- Gold history uses dedicated stooq XAUUSD provider (bypasses .us suffix normalization).
+- Stock fallback: `needs_input` removed from `_PROVIDER_SUCCESS_STATUSES` so unresolved equities fall through to DuckDuckGo web fallback.
+
+## Knowledge Injection
+- `finance_project/domains/finance/prompt/knowledge.py`: distilled MF knowledge block (~2,000 tokens).
+- Injected into prompts when query contains MF-related keywords (MF_KEYWORDS set).
+- Source: Eazyhaina 130 Q&A guide + NISM MCQ material (raw .docx files kept at project root).
+
+## Memory / Self-Knowledge
+- Stored memories use first-person ("my hobbies") — pronouns normalized to second-person ("your hobbies") in voice responses.
+- Memory content truncation bug was in `reflection.py` storage, not engine display.
 
 ## Workspace Baseline
 - Canonical working copy: root project folder (`finance_project/` package within repository root).

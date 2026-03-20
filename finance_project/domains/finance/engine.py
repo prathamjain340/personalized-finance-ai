@@ -566,6 +566,10 @@ class FinanceEngine:
             response = self._format_fx_update(facts=facts, as_of=as_of)
         elif kind == "news":
             response = self._format_news_update(facts=facts, as_of=as_of)
+        elif kind == "mf_nav":
+            response = self._format_mf_nav_update(facts=facts, as_of=as_of)
+        elif kind == "mf_history":
+            response = self._format_mf_history_update(facts=facts, as_of=as_of)
         else:
             response = self._format_generic_live_update(facts=facts, as_of=as_of)
 
@@ -755,6 +759,38 @@ class FinanceEngine:
         body = " ".join(facts[:2]).strip() if facts else "Here is the latest update."
         freshness = FinanceEngine._freshness_suffix(as_of)
         return f"{body}.{freshness}"
+
+    @staticmethod
+    def _format_mf_nav_update(facts: list[str], as_of: str) -> str:
+        _ = as_of
+        name = FinanceEngine._first_fact_value(facts, "Fund:")
+        nav = FinanceEngine._first_fact_value(facts, "NAV:")
+        nav_date = FinanceEngine._first_fact_value(facts, "NAV Date:")
+        if name and nav:
+            nav_clean = FinanceEngine._clean_price(nav)
+            date_part = f" as of {nav_date}" if nav_date else ""
+            return f"The NAV of {name} is {nav_clean} rupees{date_part}. This is market data, not a buy or sell recommendation."
+        return "I couldn't find the NAV for that fund right now."
+
+    @staticmethod
+    def _format_mf_history_update(facts: list[str], as_of: str) -> str:
+        _ = as_of
+        name = FinanceEngine._first_fact_value(facts, "Fund:")
+        period = FinanceEngine._first_fact_value(facts, "Period:")
+        start_nav = FinanceEngine._first_fact_value(facts, "Start NAV:")
+        end_nav = FinanceEngine._first_fact_value(facts, "End NAV:")
+        total_return = FinanceEngine._first_fact_value(facts, "Total return:")
+        if name and start_nav and end_nav and total_return:
+            start_clean = FinanceEngine._clean_price(start_nav)
+            end_clean = FinanceEngine._clean_price(end_nav)
+            return_clean = FinanceEngine._clean_return(total_return)
+            period_clean = FinanceEngine._clean_period(period) if period else ""
+            period_part = f" between {period_clean}" if period_clean else ""
+            return (
+                f"{name} went from {start_clean} to {end_clean} rupees{period_part}, "
+                f"a total return of {return_clean}. This is market data, not a buy or sell recommendation."
+            )
+        return "I couldn't fetch the historical performance for that fund right now."
 
     @staticmethod
     def _first_fact_value(facts: list[str], prefix: str) -> str | None:

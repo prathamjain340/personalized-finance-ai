@@ -1,6 +1,29 @@
 # Technical Decisions Log
 
-Last updated: 2026-03-17
+Last updated: 2026-03-20
+
+## 2026-03-20 - MF Knowledge Injection
+- Restored `finance_project/domains/finance/prompt/knowledge.py` with distilled Eazyhaina + NISM knowledge block.
+- `MF_KEYWORDS` frozenset gates injection — only added to prompt when query is MF-related.
+- Raw source docs (.docx) kept at project root for reference; full doc injection rejected due to ~12,000 token cost vs ~2,000 for distilled block.
+- `assembler.py` checks for MF keywords and appends `MF_KNOWLEDGE_BLOCK` to the prompt.
+
+Rationale: Model was answering MF questions from general training data. Distilled block gives accurate Eazyhaina-specific answers (ARN, tax slabs, lock-in periods) with minimal latency impact.
+
+## 2026-03-20 - Natural Voice Responses + INR Conversion
+- Engine formatters updated to produce human-friendly output: tickers replaced with labels (XAUUSD→Gold, XAGUSD→Silver), ISO timestamps replaced with "today", numbers rounded and comma-formatted.
+- All commodity/gold/stock prices converted to INR using frankfurter.app live USD/INR rate.
+- `_ticker_to_label`, `_clean_price`, `_clean_period` helpers added to `FinanceEngine`.
+- Pronoun normalization in self-knowledge voice responses: "my hobbies" → "your hobbies".
+
+Rationale: Responses were being read aloud with raw tickers, ISO timestamps, and many decimal places — unacceptable for voice UX.
+
+## 2026-03-20 - Gold/Commodity History Providers
+- Added `gold_history` kind: dedicated stooq XAUUSD CSV historical provider. Cannot reuse stock_history provider because it appends `.us` suffix (xauusd.us is invalid).
+- Added `commodity_history` kind: same stooq CSV logic but ticker extracted dynamically from LLM-populated `live_ticker` slot.
+- Slot key naming: `intent.py` strips `live_` prefix when building `live_data_slots` — use `slots.get("ticker")` not `slots.get("live_ticker")`.
+
+Rationale: "How has gold changed over 3 years?" was returning spot price. Silver/platinum history was returning error.
 
 ## 2026-03-17 - Commodity Live Data + Stock History Web Fallback
 - Added `commodity` as a new live_data_kind in intent.py and live_data_service.py.

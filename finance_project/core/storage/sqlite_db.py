@@ -1,8 +1,10 @@
+import logging
 import os
 import sqlite3
 import threading
 from pathlib import Path
 
+logger = logging.getLogger(__name__)
 
 _INIT_LOCK = threading.Lock()
 _INITIALIZED = False
@@ -89,8 +91,27 @@ def init_db() -> None:
 
                 CREATE INDEX IF NOT EXISTS idx_conversation_turns_lookup
                 ON conversation_turns(user_id, domain, created_at DESC);
+
+                CREATE TABLE IF NOT EXISTS mutual_funds (
+                    scheme_code TEXT PRIMARY KEY,
+                    scheme_name TEXT NOT NULL,
+                    nav REAL,
+                    nav_date TEXT,
+                    updated_at TIMESTAMP
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_mutual_funds_name
+                ON mutual_funds(scheme_name);
                 """
             )
+            tables = [r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()]
+            logger.info("init_db: tables present after migration: %s", tables)
+            if "mutual_funds" in tables:
+                logger.info("mutual_funds table ready")
+            else:
+                logger.error("mutual_funds table NOT found after migration — check executescript output")
 
         _INITIALIZED = True
 

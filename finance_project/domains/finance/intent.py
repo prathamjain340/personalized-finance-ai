@@ -34,6 +34,8 @@ ALLOWED_LIVE_DATA_KINDS = {
     "commodity",
     "commodity_history",
     "fx",
+    "mf_nav",
+    "mf_history",
 }
 
 PROFILE_UPDATE_FIELD_TYPES = {
@@ -225,7 +227,7 @@ def _build_turn_control_prompt(
         "- financial_category: one of [affordability, investment_advice, insurance_planning, debt_management, income_lookup, expense_lookup, savings_lookup, general]\n"
         "- question_scope: one of [general, profile_specific, hybrid]\n"
         "- self_knowledge_request: boolean\n"
-        "- live_data_kind: one of [weather, stock, stock_history, news, crypto, crypto_history, gold, gold_history, commodity, commodity_history, fx, none]\n"
+        "- live_data_kind: one of [weather, stock, stock_history, news, crypto, crypto_history, gold, gold_history, commodity, commodity_history, fx, mf_nav, mf_history, none]\n"
         "- live_ticker: string or null\n"
         "- live_company: string or null\n"
         "- live_coin: string or null\n"
@@ -258,6 +260,8 @@ def _build_turn_control_prompt(
         "- Extract multiple profile fields if user provides them in one message.\n"
         "- If any update is unclear, leave that field out.\n"
         "- Set live_data_kind only when user explicitly asks for current or historical data updates.\n"
+        "- For Indian mutual fund NAV or price queries (e.g. 'What is the NAV of Parag Parikh', 'current NAV of SBI Bluechip'), use live_data_kind=mf_nav and set live_company to the fund name.\n"
+        "- For Indian mutual fund historical performance queries (e.g. 'how has HDFC Mid Cap performed over 1 year', 'SBI Bluechip returns'), use live_data_kind=mf_history and set live_company to the fund name and live_window_days when available.\n"
         "- For non-gold commodity or precious metal spot prices (silver, oil, platinum, natural gas, etc.), use live_data_kind=commodity.\n"
         "- For non-gold commodity historical performance questions (how has silver/platinum/palladium done, past trend, etc.), use live_data_kind=commodity_history and fill live_window_days when available.\n"
         "- For commodity queries (spot or history), populate live_ticker with the stooq/forex spot symbol if you can determine it (e.g., XAGUSD for silver, XPTUSD for platinum, XPDUSD for palladium).\n"

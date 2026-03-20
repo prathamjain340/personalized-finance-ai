@@ -1,6 +1,6 @@
 # User Preferences
 
-Last updated: 2026-03-17
+Last updated: 2026-03-20
 
 ## Product Behavior Priorities
 - Ask for missing core profile data when advice is personalized.
@@ -11,6 +11,11 @@ Last updated: 2026-03-17
 - Avoid hardcoded keyword-only routing/matching; prefer model/context-driven and language-agnostic logic.
 - Prefer hybrid live-data architecture: structured providers first, generalized web fallback for unsupported/failing live asks.
 - Do not hardcode specific names, symbols, or terms in routing logic — let the model classify and web search resolve.
+
+## Voice UX Priorities
+- Responses must sound natural when read aloud — no tickers, ISO timestamps, or raw decimals.
+- Prices should be in INR, rounded, comma-formatted.
+- Prefer shorter responses; reduce TTS time without cutting answers mid-thought.
 
 ## Testing Workflow Preferences
 - Compare multiple app variants in Voice Lab side-by-side before merging features.

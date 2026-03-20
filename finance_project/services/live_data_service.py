@@ -11,6 +11,7 @@ import requests
 from finance_project.core.llm.client import generate_response
 from finance_project.core.logging.logger import log_event
 from finance_project.services.live_data_search import search_web
+from finance_project.services.mf_nav_service import search_mf, get_mf_history
 
 
 _LIVE_ENABLED = os.getenv("LIVE_DATA_ENABLED", "true").lower() not in {"0", "false", "off", "no"}
@@ -44,6 +45,8 @@ _ALLOWED_LIVE_KINDS = {
     "commodity",
     "commodity_history",
     "fx",
+    "mf_nav",
+    "mf_history",
 }
 _PROVIDER_SUCCESS_STATUSES = {"ok", "blocked"}
 
@@ -319,6 +322,70 @@ def _run_structured_provider_chain(
     )
 
 
+def _provider_mf_nav(query: str, profile: dict, slots: dict[str, Any]) -> dict[str, Any]:
+    _ = profile
+    fund_query = _to_text(slots.get("company")) or query
+    matches = search_mf(fund_query, top_n=1)
+    if not matches:
+        return _build_payload(
+            kind="mf_nav",
+            status="error",
+            message="I couldn't find that mutual fund.",
+            provider="amfi_cache",
+            failure_reason="no_match",
+        )
+    fund = matches[0]
+    facts = [
+        f"Fund: {fund['name']}",
+        f"NAV: {fund['nav']}",
+        f"NAV Date: {fund['nav_date']}",
+        f"Scheme Code: {fund['scheme_code']}",
+    ]
+    return _build_payload(kind="mf_nav", status="ok", facts=facts, provider="amfi_cache")
+
+
+def _provider_mf_history(query: str, profile: dict, slots: dict[str, Any]) -> dict[str, Any]:
+    _ = profile
+    fund_query = _to_text(slots.get("company")) or query
+    matches = search_mf(fund_query, top_n=1)
+    if not matches:
+        return _build_payload(
+            kind="mf_history",
+            status="error",
+            message="I couldn't find that mutual fund.",
+            provider="mfapi",
+            failure_reason="no_match",
+        )
+    fund = matches[0]
+    window_days = slots.get("window_days") or 365
+    history = get_mf_history(fund["scheme_code"], days=window_days)
+    if not history:
+        return _build_payload(
+            kind="mf_history",
+            status="error",
+            message="I couldn't fetch historical NAV data.",
+            provider="mfapi",
+            failure_reason="fetch_failed",
+        )
+    latest = history[0]
+    oldest = history[-1]
+    try:
+        start_nav = float(oldest["nav"])
+        end_nav = float(latest["nav"])
+        total_return = round((end_nav - start_nav) / start_nav * 100, 2) if start_nav else None
+    except (TypeError, ValueError, ZeroDivisionError):
+        total_return = None
+    facts = [
+        f"Fund: {fund['name']}",
+        f"Period: {oldest['date']} to {latest['date']}",
+        f"Start NAV: {oldest['nav']}",
+        f"End NAV: {latest['nav']}",
+    ]
+    if total_return is not None:
+        facts.append(f"Total return: {total_return}%")
+    return _build_payload(kind="mf_history", status="ok", facts=facts, provider="mfapi")
+
+
 def _provider_registry(kind: str) -> list[tuple[str, Any]]:
     if kind == "weather":
         return [("open_meteo", _provider_weather_open_meteo)]
@@ -340,6 +407,10 @@ def _provider_registry(kind: str) -> list[tuple[str, Any]]:
         return [("stooq_history", _provider_commodity_history_stooq)]
     if kind == "fx":
         return [("frankfurter", _provider_fx_frankfurter)] if _FX_ENABLED else [("feature_flag", _provider_disabled)]
+    if kind == "mf_nav":
+        return [("amfi_cache", _provider_mf_nav)]
+    if kind == "mf_history":
+        return [("mfapi", _provider_mf_history)]
     if kind == "news":
         providers: list[tuple[str, Any]] = []
         if _NEWS_WEB_ENABLED:
