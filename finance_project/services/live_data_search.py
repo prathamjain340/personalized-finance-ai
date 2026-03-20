@@ -24,13 +24,14 @@ def search_web(query: str, max_results: int | None = None) -> list[dict[str, Any
 
     limit = max(1, min(8, int(max_results or _WEB_SEARCH_MAX_RESULTS)))
     headers = {
-        "User-Agent": "Mozilla/5.0",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
     }
 
     try:
         resp = requests.get(
-            "https://duckduckgo.com/html/",
+            "https://lite.duckduckgo.com/lite/",
             params={"q": text},
             headers=headers,
             timeout=_WEB_SEARCH_TIMEOUT_SECONDS,
@@ -40,12 +41,14 @@ def search_web(query: str, max_results: int | None = None) -> list[dict[str, Any
         return []
 
     body = resp.text or ""
+
+    # Match by DDG redirect URL in href — does not rely on class names
     anchor_pattern = re.compile(
-        r'<a[^>]*class="[^"]*result__a[^"]*"[^>]*href="([^"]+)"[^>]*>(.*?)</a>',
+        r'<a\s[^>]*href="(https?://(?:www\.)?duckduckgo\.com/l/\?[^"]+)"[^>]*>(.*?)</a>',
         flags=re.IGNORECASE | re.DOTALL,
     )
     snippet_pattern = re.compile(
-        r'<a[^>]*class="[^"]*result__a[^"]*"[^>]*>.*?</a>[\s\S]{0,300}?<a[^>]*class="[^"]*result__snippet[^"]*"[^>]*>(.*?)</a>',
+        r'class="[^"]*snippet[^"]*"[^>]*>(.*?)</(?:td|span|div)>',
         flags=re.IGNORECASE | re.DOTALL,
     )
 
@@ -84,7 +87,16 @@ def _normalize_search_url(raw_href: str) -> str:
     if not href:
         return ""
 
+    # Handle relative DDG redirect: /l/?uddg=...
     if href.startswith("/l/?"):
+        parsed = urlparse(href)
+        target = parse_qs(parsed.query).get("uddg", [None])[0]
+        if target:
+            return unquote(target).strip()
+        return ""
+
+    # Handle absolute DDG redirect (all forms): https://duckduckgo.com/l/?...&uddg=...
+    if "duckduckgo.com/l/?" in href:
         parsed = urlparse(href)
         target = parse_qs(parsed.query).get("uddg", [None])[0]
         if target:

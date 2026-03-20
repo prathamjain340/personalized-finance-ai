@@ -75,6 +75,43 @@ def _canonicalize_preference(content: str) -> str:
     return _ensure_terminal(f"User {_clean_fragment(body)}")
 
 
+def _canonicalize_interest(content: str) -> str:
+    body = re.sub(r"^\s*user\s+", "", _normalize_spaces(content), flags=re.IGNORECASE)
+    body = re.sub(r"^\s*(?:interest|hobby|hobbies)\s*:\s*", "", body, flags=re.IGNORECASE)
+    body = re.sub(r"^\s*(?:likes?|enjoys?)\s+", "", body, flags=re.IGNORECASE)
+    value = _split_preference_value(body)
+    if not value:
+        return ""
+    if value.lower().startswith("to "):
+        value = value[3:].strip()
+    return f"User interest: {value}."
+
+
+def _canonicalize_dislike(content: str) -> str:
+    body = re.sub(r"^\s*user\s+", "", _normalize_spaces(content), flags=re.IGNORECASE)
+    body = re.sub(r"^\s*dislikes?\s*", "", body, flags=re.IGNORECASE)
+    body = re.sub(r"^\s*(?:does not like|do not like|don't like|hate)\s*", "", body, flags=re.IGNORECASE)
+    value = _split_preference_value(body)
+    if not value:
+        return ""
+    return f"User dislikes {value}."
+
+
+def _canonicalize_goal(content: str) -> str:
+    body = re.sub(r"^\s*user\s+", "", _normalize_spaces(content), flags=re.IGNORECASE)
+    body = re.sub(r"^\s*goal\s*:\s*", "", body, flags=re.IGNORECASE)
+    body = re.sub(r"^\s*goal\s+is\s+to\s*", "", body, flags=re.IGNORECASE)
+    body = re.sub(r"^\s*i\s+want\s+to\s*", "", body, flags=re.IGNORECASE)
+    body = re.sub(r"^\s*i(?:'m| am)\s+planning\s+to\s*", "", body, flags=re.IGNORECASE)
+    body = re.split(r"\b(?:should i|can i|what should)\b", body, maxsplit=1, flags=re.IGNORECASE)[0]
+    value = _clean_fragment(body)
+    if not value:
+        return ""
+    if value.lower().startswith("to "):
+        value = value[3:].strip()
+    return f"User goal is to {value}."
+
+
 def _canonicalize_behavioral(content: str) -> str:
     normalized = _normalize_spaces(content)
     match = re.search(r"major spending categories\s*:\s*(.+)", normalized, flags=re.IGNORECASE)
@@ -98,12 +135,46 @@ def _canonicalize_behavioral(content: str) -> str:
     return f"User major spending categories: {', '.join(categories[:6])}."
 
 
+def _canonicalize_assistant_note(content: str) -> str:
+    body = _normalize_spaces(content)
+    body = re.sub(r"^\s*assistant\s*note\s*:\s*", "", body, flags=re.IGNORECASE)
+    body = _clean_fragment(body)
+    if not body:
+        return ""
+    if len(body) > 240:
+        body = body[:240].rstrip(" ,;:")
+    return f"Assistant note: {body}."
+
+
+def _normalize_memory_type(memory_type: str) -> str:
+    normalized = str(memory_type or "").strip().lower()
+    if normalized in {"hobby", "hobbies"}:
+        return "interest"
+    if normalized == "likes":
+        return "interest"
+    if normalized == "goals":
+        return "goal"
+    if normalized == "preferences":
+        return "preference"
+    if normalized in {"assistant_notes", "assistantnote", "assistant-notes"}:
+        return "assistant_note"
+    return normalized
+
+
 def _canonicalize_content(memory_type: str, content: str) -> str:
     normalized = _normalize_spaces(content)
     if memory_type == "preference":
         return _canonicalize_preference(normalized)
+    if memory_type == "interest":
+        return _canonicalize_interest(normalized)
+    if memory_type == "dislike":
+        return _canonicalize_dislike(normalized)
+    if memory_type == "goal":
+        return _canonicalize_goal(normalized)
     if memory_type == "behavioral":
         return _canonicalize_behavioral(normalized)
+    if memory_type == "assistant_note":
+        return _canonicalize_assistant_note(normalized)
     return _ensure_terminal(_clean_fragment(normalized))
 
 
@@ -111,7 +182,7 @@ def normalize_memory_candidate(memory: dict) -> dict | None:
     if not isinstance(memory, dict):
         return None
 
-    memory_type = str(memory.get("type") or "").strip().lower()
+    memory_type = _normalize_memory_type(memory.get("type") or "")
     raw_content = str(memory.get("content") or "").strip()
     if not memory_type or not raw_content:
         return None

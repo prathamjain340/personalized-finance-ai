@@ -40,9 +40,12 @@ _ALLOWED_LIVE_KINDS = {
     "crypto",
     "crypto_history",
     "gold",
+    "gold_history",
+    "commodity",
+    "commodity_history",
     "fx",
 }
-_PROVIDER_SUCCESS_STATUSES = {"ok", "needs_input", "blocked"}
+_PROVIDER_SUCCESS_STATUSES = {"ok", "blocked"}
 
 
 def _extract_json_object(raw_text: str) -> dict | None:
@@ -150,6 +153,52 @@ def classify_live_data_kind(query: str) -> Optional[str]:
     return None
 
 
+_INR_CONVERT_KINDS = {"gold", "commodity", "crypto"}
+
+
+def _get_usd_inr_rate() -> float | None:
+    """Fetch current USD/INR spot rate from frankfurter."""
+    try:
+        resp = requests.get(
+            "https://api.frankfurter.app/latest",
+            params={"from": "USD", "to": "INR"},
+            timeout=max(4.0, _HTTP_TIMEOUT_SECONDS),
+        )
+        resp.raise_for_status()
+        rate = (resp.json() or {}).get("rates", {}).get("INR")
+        return float(rate) if rate else None
+    except Exception:
+        return None
+
+
+def _append_inr_price(payload: dict) -> dict:
+    """Add 'Last price INR:' fact to payload when a USD 'Last price:' fact exists."""
+    facts = list(payload.get("facts") or [])
+    usd_fact = next((f for f in facts if f.startswith("Last price:")), None)
+    if not usd_fact:
+        return payload
+    price_str = usd_fact[len("Last price:"):].strip()
+    m = re.match(r"^([0-9]+(?:\.[0-9]*)?)", price_str)
+    if not m:
+        return payload
+    try:
+        price_usd = float(m.group(1))
+    except ValueError:
+        return payload
+    rate = _get_usd_inr_rate()
+    if not rate:
+        return payload
+    price_inr = round(price_usd * rate)
+    new_facts = list(facts)
+    new_facts.append(f"Last price INR: {price_inr:,}")
+    if "troy ounce" in price_str.lower():
+        price_per_10g_inr = round(price_usd * rate / 31.1035 * 10)
+        new_facts.append(f"Last price INR per 10g: {price_per_10g_inr:,}")
+    payload = dict(payload)
+    payload["facts"] = new_facts
+    return payload
+
+
 def maybe_fetch_live_data(
     query: str,
     profile: Optional[dict] = None,
@@ -183,6 +232,8 @@ def maybe_fetch_live_data(
         slots=slots,
     )
     if structured and str(structured.get("status") or "").lower() in _PROVIDER_SUCCESS_STATUSES:
+        if kind in _INR_CONVERT_KINDS:
+            structured = _append_inr_price(structured)
         _log_live_route(query, structured)
         return structured
 
@@ -281,6 +332,12 @@ def _provider_registry(kind: str) -> list[tuple[str, Any]]:
         return [("coingecko", _provider_crypto_history_coingecko)] if _CRYPTO_ENABLED else [("feature_flag", _provider_disabled)]
     if kind == "gold":
         return [("yahoo_finance", _provider_gold_yahoo), ("stooq", _provider_gold_stooq)] if _GOLD_ENABLED else [("feature_flag", _provider_disabled)]
+    if kind == "gold_history":
+        return [("stooq_history", _provider_gold_history)] if _GOLD_ENABLED else [("feature_flag", _provider_disabled)]
+    if kind == "commodity":
+        return [("stooq", _provider_commodity_stooq)]
+    if kind == "commodity_history":
+        return [("stooq_history", _provider_commodity_history_stooq)]
     if kind == "fx":
         return [("frankfurter", _provider_fx_frankfurter)] if _FX_ENABLED else [("feature_flag", _provider_disabled)]
     if kind == "news":
@@ -363,6 +420,147 @@ def _provider_gold_stooq(query: str, profile: dict, slots: dict[str, Any]) -> di
     _ = profile
     _ = slots
     return _fetch_gold_spot_stooq(query=query)
+
+
+def _provider_gold_history(query: str, profile: dict, slots: dict[str, Any]) -> dict[str, Any]:
+    _ = profile
+    return _fetch_gold_history_stooq(query=query, window_days_hint=slots.get("window_days"))
+
+
+def _provider_commodity_history_stooq(query: str, profile: dict, slots: dict[str, Any]) -> dict[str, Any]:
+    _ = profile
+    ticker = _to_text(slots.get("ticker"))
+    if not ticker:
+        return _build_payload(
+            kind="commodity_history",
+            status="error",
+            message="I couldn't determine the commodity symbol.",
+            provider="stooq_history",
+            failure_reason="no_ticker",
+        )
+    return _fetch_commodity_history_stooq(
+        query=query, ticker=ticker, window_days_hint=slots.get("window_days")
+    )
+
+
+def _fetch_commodity_history_stooq(
+    query: str, ticker: str, window_days_hint: Optional[int] = None
+) -> dict[str, Any]:
+    symbol = ticker.lower()
+    window_days = _normalize_history_window_days(
+        window_days_hint or _extract_history_window_days(query), default_days=1095
+    )
+    end_date = dt.datetime.utcnow().date()
+    start_date = end_date - dt.timedelta(days=window_days)
+
+    try:
+        resp = requests.get(
+            "https://stooq.com/q/d/l/",
+            params={"s": symbol, "i": "d"},
+            timeout=max(8.0, _HTTP_TIMEOUT_SECONDS),
+        )
+        resp.raise_for_status()
+        lines = [line.strip() for line in (resp.text or "").splitlines() if line.strip()]
+        if len(lines) < 3:
+            return _build_payload(
+                kind="commodity_history",
+                status="error",
+                message=f"I couldn't fetch historical data for {ticker.upper()}.",
+                sources=["https://stooq.com/"],
+                provider="stooq_history",
+            )
+
+        closes: list[float] = []
+        filtered_dates: list[str] = []
+        for row in lines[1:]:
+            parts = [p.strip() for p in row.split(",")]
+            if len(parts) < 5:
+                continue
+            date_str, close_str = parts[0], parts[4]
+            if close_str in {"", "N/D"}:
+                continue
+            try:
+                row_date = dt.datetime.strptime(date_str, "%Y-%m-%d").date()
+                close_value = float(close_str)
+            except Exception:
+                continue
+            if row_date < start_date or row_date > end_date:
+                continue
+            closes.append(close_value)
+            filtered_dates.append(row_date.isoformat())
+
+        if len(closes) < 2:
+            return _build_payload(
+                kind="commodity_history",
+                status="error",
+                message=f"I couldn't fetch enough historical points for {ticker.upper()}.",
+                sources=["https://stooq.com/"],
+                provider="stooq_history",
+            )
+
+        start_price = closes[0]
+        end_price = closes[-1]
+        total_return = ((end_price - start_price) / start_price) * 100 if start_price else 0.0
+        facts = [
+            f"Instrument: {ticker.upper()}",
+            f"Period: {filtered_dates[0]} to {filtered_dates[-1]}",
+            f"Start price: {round(start_price, 2)}",
+            f"End price: {round(end_price, 2)}",
+            f"Total return: {round(total_return, 2)}%",
+        ]
+        return _build_payload(
+            kind="commodity_history",
+            status="ok",
+            facts=facts,
+            sources=["https://stooq.com/"],
+            provider="stooq_history",
+        )
+    except Exception:
+        return _build_payload(
+            kind="commodity_history",
+            status="error",
+            message=f"I couldn't fetch historical data for {ticker.upper()} right now.",
+            sources=["https://stooq.com/"],
+            provider="stooq_history",
+        )
+
+
+def _provider_commodity_stooq(query: str, profile: dict, slots: dict[str, Any]) -> dict[str, Any]:
+    _ = query
+    _ = profile
+    ticker = _to_text(slots.get("ticker"))
+    if not ticker:
+        return _build_payload(
+            kind="commodity",
+            status="error",
+            message="I couldn't determine the commodity symbol.",
+            provider="stooq",
+            failure_reason="no_ticker",
+        )
+    symbol = ticker.lower()
+    try:
+        resp = requests.get(
+            "https://stooq.com/q/l/",
+            params={"s": symbol, "f": "sd2t2ohlcv", "h": "", "e": "csv"},
+            timeout=max(6.0, _HTTP_TIMEOUT_SECONDS),
+        )
+        resp.raise_for_status()
+        lines = [line.strip() for line in (resp.text or "").splitlines() if line.strip()]
+        if len(lines) < 2:
+            return _build_payload(kind="commodity", status="error", provider="stooq", failure_reason="provider_failed")
+        parts = [p.strip() for p in lines[1].split(",")]
+        if len(parts) < 7 or parts[6] in {"", "N/D"}:
+            return _build_payload(kind="commodity", status="error", provider="stooq", failure_reason="provider_failed")
+        out_symbol, date_s, time_s, open_s, high_s, low_s, close_s = parts[:7]
+        facts = [
+            f"Instrument: {out_symbol}",
+            f"Last price: {close_s} USD per troy ounce",
+            f"Open/High/Low: {open_s}/{high_s}/{low_s}",
+            f"Trade date/time: {date_s} {time_s}",
+        ]
+        return _build_payload(kind="commodity", status="ok", facts=facts, sources=["https://stooq.com/"], provider="stooq")
+    except Exception:
+        return _build_payload(kind="commodity", status="error", provider="stooq", failure_reason="provider_failed")
 
 
 def _provider_fx_frankfurter(query: str, profile: dict, slots: dict[str, Any]) -> dict[str, Any]:
@@ -1102,6 +1300,86 @@ def _fetch_gold_spot_stooq(query: str) -> dict[str, Any]:
         provider="stooq",
         failure_reason="provider_failed",
     )
+
+
+def _fetch_gold_history_stooq(query: str, window_days_hint: Optional[int] = None) -> dict[str, Any]:
+    window_days = _normalize_history_window_days(
+        window_days_hint or _extract_history_window_days(query), default_days=1095
+    )
+    end_date = dt.datetime.utcnow().date()
+    start_date = end_date - dt.timedelta(days=window_days)
+
+    try:
+        resp = requests.get(
+            "https://stooq.com/q/d/l/",
+            params={"s": "xauusd", "i": "d"},
+            timeout=max(8.0, _HTTP_TIMEOUT_SECONDS),
+        )
+        resp.raise_for_status()
+        lines = [line.strip() for line in (resp.text or "").splitlines() if line.strip()]
+        if len(lines) < 3:
+            return _build_payload(
+                kind="gold_history",
+                status="error",
+                message="I couldn't fetch historical gold data right now.",
+                sources=["https://stooq.com/"],
+                provider="stooq_history",
+            )
+
+        closes: list[float] = []
+        filtered_dates: list[str] = []
+        for row in lines[1:]:
+            parts = [part.strip() for part in row.split(",")]
+            if len(parts) < 5:
+                continue
+            date_str = parts[0]
+            close_str = parts[4]
+            if close_str in {"", "N/D"}:
+                continue
+            try:
+                row_date = dt.datetime.strptime(date_str, "%Y-%m-%d").date()
+                close_value = float(close_str)
+            except Exception:
+                continue
+            if row_date < start_date or row_date > end_date:
+                continue
+            closes.append(close_value)
+            filtered_dates.append(row_date.isoformat())
+
+        if len(closes) < 2:
+            return _build_payload(
+                kind="gold_history",
+                status="error",
+                message="I couldn't fetch enough historical points for gold.",
+                sources=["https://stooq.com/"],
+                provider="stooq_history",
+            )
+
+        start_price = closes[0]
+        end_price = closes[-1]
+        total_return = ((end_price - start_price) / start_price) * 100 if start_price else 0.0
+        facts = [
+            "Instrument: XAUUSD",
+            f"Period: {filtered_dates[0]} to {filtered_dates[-1]}",
+            f"Start price: {round(start_price, 2)}",
+            f"End price: {round(end_price, 2)}",
+            f"Total return: {round(total_return, 2)}%",
+        ]
+        return _build_payload(
+            kind="gold_history",
+            status="ok",
+            facts=facts,
+            sources=["https://stooq.com/"],
+            provider="stooq_history",
+        )
+    except Exception:
+        return _build_payload(
+            kind="gold_history",
+            status="error",
+            message="I couldn't fetch historical gold data right now.",
+            sources=["https://stooq.com/"],
+            provider="stooq_history",
+        )
 
 
 def _fetch_fx_rate(

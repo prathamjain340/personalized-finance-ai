@@ -30,6 +30,9 @@ ALLOWED_LIVE_DATA_KINDS = {
     "crypto",
     "crypto_history",
     "gold",
+    "gold_history",
+    "commodity",
+    "commodity_history",
     "fx",
 }
 
@@ -222,7 +225,7 @@ def _build_turn_control_prompt(
         "- financial_category: one of [affordability, investment_advice, insurance_planning, debt_management, income_lookup, expense_lookup, savings_lookup, general]\n"
         "- question_scope: one of [general, profile_specific, hybrid]\n"
         "- self_knowledge_request: boolean\n"
-        "- live_data_kind: one of [weather, stock, stock_history, news, crypto, crypto_history, gold, fx, none]\n"
+        "- live_data_kind: one of [weather, stock, stock_history, news, crypto, crypto_history, gold, gold_history, commodity, commodity_history, fx, none]\n"
         "- live_ticker: string or null\n"
         "- live_company: string or null\n"
         "- live_coin: string or null\n"
@@ -249,13 +252,17 @@ def _build_turn_control_prompt(
         "- question_scope=profile_specific when user asks about their own situation or affordability.\n"
         "- question_scope=general for conceptual questions not requiring user-specific data.\n"
         "- question_scope=hybrid when user asks concept + personal implication in same turn.\n"
-        "- self_knowledge_request=true only when user asks what you know/remember about them (profile, likes, dislikes, preferences, memories).\n"
+        "- self_knowledge_request=true when user asks what you know/remember about them OR asks what you suggested/recommended earlier.\n"
         "- For personal-memory lookup like 'what is my name', keep finance_query=true with intent=general.\n"
         "- Definitions inside finance (e.g., what is savings account) use financial_category=general.\n"
         "- Extract multiple profile fields if user provides them in one message.\n"
         "- If any update is unclear, leave that field out.\n"
         "- Set live_data_kind only when user explicitly asks for current or historical data updates.\n"
+        "- For non-gold commodity or precious metal spot prices (silver, oil, platinum, natural gas, etc.), use live_data_kind=commodity.\n"
+        "- For non-gold commodity historical performance questions (how has silver/platinum/palladium done, past trend, etc.), use live_data_kind=commodity_history and fill live_window_days when available.\n"
+        "- For commodity queries (spot or history), populate live_ticker with the stooq/forex spot symbol if you can determine it (e.g., XAGUSD for silver, XPTUSD for platinum, XPDUSD for palladium).\n"
         "- For stock-history performance questions use stock_history and fill live_window_days when available.\n"
+        "- For gold historical performance questions (how has gold done, gold price trend, etc.) use gold_history and fill live_window_days when available.\n"
         "- For crypto historical performance questions use crypto_history and fill live_window_days when available.\n"
         "- For fx queries populate pair and/or base_currency + quote_currency when possible.\n"
         "- For crypto queries populate live_coin when available.\n"

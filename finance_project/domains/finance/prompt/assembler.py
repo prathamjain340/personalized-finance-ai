@@ -8,6 +8,7 @@ from finance_project.domains.finance.prompt.base import (
     ASSISTANT_PERSONA,
     SAFETY_BOUNDARY,
 )
+from finance_project.domains.finance.prompt.knowledge import MF_KEYWORDS, MF_KNOWLEDGE_BLOCK
 
 
 def _clip_text(text: str, max_chars: int) -> str:
@@ -108,6 +109,7 @@ def assemble_prompt(
             pending_field=pending_field,
         ),
         _continuity_rules(previous_assistant_response=previous_assistant_response),
+        _inject_knowledge(raw_query=raw_query),
     ]
     return "\n\n".join(part for part in prompt_sections if part)
 
@@ -213,10 +215,9 @@ def _response_rules(response_mode: str, response_channel: str = "text") -> str:
         channel_rules = (
             "VOICE RULES:\n"
             "- Respond in natural spoken sentences only. No bullets, markdown, or list formatting.\n"
-            "- Use 1 complete sentence for factual answers; up to 2 complete sentences for advice.\n"
+            "- Maximum 2 sentences for the answer, then optionally 1 short follow-up question. 3 sentences total maximum.\n"
             "- Never output numbered lists in voice mode.\n"
             "- Preserve key facts and numbers while staying concise.\n"
-            "- If a longer answer is needed, give the top recommendation first and offer details on follow-up.\n"
             "- Always end on a complete sentence."
         )
     else:
@@ -317,6 +318,13 @@ def _continuity_rules(previous_assistant_response: Optional[str]) -> str:
         f"{clipped}\n"
         "- Do not reuse the same framing unless user asks for repetition."
     )
+
+
+def _inject_knowledge(raw_query: str) -> str:
+    q = raw_query.lower()
+    if any(kw in q for kw in MF_KEYWORDS):
+        return f"REFERENCE KNOWLEDGE (use to answer accurately, do not quote verbatim):\n{MF_KNOWLEDGE_BLOCK}"
+    return ""
 
 
 def assemble_clarification_prompt(

@@ -22,6 +22,11 @@ class ChatSession:
         self.pending_field: Optional[str] = None
         self.profile_collection_goal: Optional[str] = None
         self.profile_collection_queue: list[str] = []
+        self.pending_followup_kind: Optional[str] = None
+        self.pending_followup_field: Optional[str] = None
+        self.pending_followup_question: Optional[str] = None
+        self.pending_followup_created_turn: Optional[int] = None
+        self.turn_index: int = 0
         self.stage: ConversationStage = ConversationStage.INITIAL
         self.has_started = False
 
@@ -42,6 +47,9 @@ class ChatSession:
             f"Pending field: {self.pending_field or 'none'}",
             f"Profile collection goal: {self.profile_collection_goal or 'none'}",
             f"Profile collection queue: {', '.join(self.profile_collection_queue) if self.profile_collection_queue else 'none'}",
+            f"Pending follow-up kind: {self.pending_followup_kind or 'none'}",
+            f"Pending follow-up field: {self.pending_followup_field or 'none'}",
+            f"Pending follow-up question: {self._clip_turn_text(self.pending_followup_question or 'none', max_chars=120)}",
             "",
             "Recent conversation turns:",
         ]
@@ -74,6 +82,7 @@ class ChatSession:
         self.recent_turns.append((user_message, assistant_response))
         if len(self.recent_turns) > 4:
             self.recent_turns = self.recent_turns[-4:]
+        self.turn_index += 1
 
         # ---- stage progression (enum-aligned) ----
         if self.stage == ConversationStage.INITIAL:

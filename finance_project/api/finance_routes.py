@@ -10,14 +10,16 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from uuid import uuid4
 from time import perf_counter
+import json
 import re
 
 from finance_project.domains.finance.engine import FinanceEngine
-from finance_project.domains.finance.intent import TurnControl, infer_turn_control
+from finance_project.domains.finance.intent import QueryRouting, TurnControl, infer_turn_control
 from finance_project.core.chat.session import ChatSession
 from finance_project.core.logging.logger import log_event
 from finance_project.core.postprocess.dispatcher import enqueue_profile_updates
 from finance_project.core.profile.repository import get_profile, merge_profiles
+from finance_project.core.llm.client import generate_response
 from finance_project.services.profile_client import fetch_financial_profile
 from finance_project.services.greeting_service import (
     build_greeting,
@@ -38,6 +40,22 @@ CORE_FINANCE_FIELDS = ("monthly_income", "monthly_expenses", "monthly_savings")
 PORTFOLIO_REQUIRED_FIELDS = ("monthly_income", "monthly_expenses", "monthly_savings", "existing_investments")
 _DEVANAGARI_RE = re.compile(r"[\u0900-\u097F]")
 _ARABIC_RE = re.compile(r"[\u0600-\u06FF]")
+_FOLLOWUP_MAX_TURN_AGE = 2
+_FOLLOWUP_ACKS = {
+    "yes",
+    "yeah",
+    "yup",
+    "ok",
+    "okay",
+    "sure",
+    "go ahead",
+    "please continue",
+    "continue",
+    "haan",
+    "han",
+    "ji",
+}
+_ALLOWED_FOLLOWUP_KINDS = {"profile_field", "decision", "clarification"}
 
 
 def _to_number(value) -> float | None:
@@ -289,6 +307,239 @@ def _apply_turn_control(session: ChatSession, turn_control: TurnControl) -> None
         session.pending_field = None
 
 
+def _clear_followup_tracker(session: ChatSession, reason: str) -> None:
+    if (
+        session.pending_followup_kind
+        or session.pending_followup_field
+        or session.pending_followup_question
+        or session.pending_followup_created_turn is not None
+    ):
+        log_event(
+            event="followup_tracker_cleared",
+            metadata={
+                "user_id": session.user_id,
+                "reason": reason,
+                "kind": session.pending_followup_kind,
+                "field": session.pending_followup_field,
+            },
+        )
+    session.pending_followup_kind = None
+    session.pending_followup_field = None
+    session.pending_followup_question = None
+    session.pending_followup_created_turn = None
+
+
+def _is_followup_tracker_active(session: ChatSession) -> bool:
+    if not session.pending_followup_question:
+        return False
+    created_turn = session.pending_followup_created_turn
+    if created_turn is None:
+        return True
+    return (session.turn_index - created_turn) <= _FOLLOWUP_MAX_TURN_AGE
+
+
+def _expire_followup_tracker_if_stale(session: ChatSession) -> None:
+    if not session.pending_followup_question:
+        return
+    created_turn = session.pending_followup_created_turn
+    if created_turn is None:
+        return
+    if (session.turn_index - created_turn) > _FOLLOWUP_MAX_TURN_AGE:
+        _clear_followup_tracker(session, reason="expired")
+
+
+def _is_terse_followup_reply(user_text: str) -> bool:
+    text = " ".join(str(user_text or "").strip().lower().split())
+    if not text:
+        return False
+    if text in _FOLLOWUP_ACKS:
+        return True
+    words = re.findall(r"[a-zA-Z0-9$.,₹]+", text)
+    if len(words) <= 4 and "?" not in text:
+        return True
+    numeric_like = re.fullmatch(r"[0-9,\s.$₹kmlacrorerupeesinr-]+", text) is not None
+    if numeric_like and len(words) <= 8:
+        return True
+    return False
+
+
+def _augment_user_text_with_followup_context(user_text: str, session: ChatSession) -> str:
+    base = str(user_text or "").strip()
+    question = str(session.pending_followup_question or "").strip()
+    kind = str(session.pending_followup_kind or "decision").strip().lower()
+    field = str(session.pending_followup_field or "none").strip().lower()
+    if not question:
+        return base
+    return (
+        f"{base}\n\n"
+        f"This is a direct follow-up reply to the assistant question: {question}\n"
+        f"Pending follow-up kind: {kind}\n"
+        f"Pending follow-up field: {field}"
+    ).strip()
+
+
+def _extract_json_payload(raw_text: str) -> dict | None:
+    text = str(raw_text or "").strip()
+    if not text:
+        return None
+    try:
+        payload = json.loads(text)
+        if isinstance(payload, dict):
+            return payload
+    except json.JSONDecodeError:
+        pass
+    match = re.search(r"\{[\s\S]*\}", text)
+    if not match:
+        return None
+    try:
+        payload = json.loads(match.group(0))
+    except json.JSONDecodeError:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _extract_latest_question(text: str) -> str | None:
+    normalized = " ".join(str(text or "").split())
+    if "?" not in normalized:
+        return None
+    questions = re.findall(r"([^?]{6,}\?)", normalized)
+    if questions:
+        return questions[-1].strip()
+    return normalized.strip() if normalized.strip().endswith("?") else None
+
+
+def _infer_followup_contract(assistant_response: str, pending_field_hint: str | None = None) -> dict:
+    response_text = " ".join(str(assistant_response or "").split()).strip()
+    if not response_text:
+        return {"has_followup": False, "kind": None, "field": None, "question": None}
+    extracted_question = _extract_latest_question(response_text)
+    has_explicit_question = bool(extracted_question and "?" in response_text)
+    if not has_explicit_question:
+        return {"has_followup": False, "kind": None, "field": None, "question": None}
+
+    prompt = (
+        "You extract whether the assistant just asked a concrete follow-up question.\n"
+        "Return STRICT JSON only with keys:\n"
+        "- has_followup: boolean\n"
+        "- kind: one of [profile_field, decision, clarification, none]\n"
+        "- field: one of [monthly_income, monthly_expenses, monthly_savings, existing_investments, none]\n"
+        "- question: short question string or null\n"
+        f"Assistant response: {response_text}\n"
+        f"Pending field hint: {pending_field_hint or 'none'}"
+    )
+    raw = generate_response(prompt, operation="turn_control")
+    payload = _extract_json_payload(raw)
+    if isinstance(payload, dict):
+        has_followup = bool(payload.get("has_followup"))
+        kind = str(payload.get("kind") or "").strip().lower()
+        if kind == "none" or kind not in (_ALLOWED_FOLLOWUP_KINDS | {"none"}):
+            kind = None
+        field = str(payload.get("field") or "").strip().lower()
+        if field in {"none", "null", ""}:
+            field = None
+        if field not in {None, "monthly_income", "monthly_expenses", "monthly_savings", "existing_investments"}:
+            field = None
+        question = extracted_question or (str(payload.get("question") or "").strip() or None)
+        if has_followup and question:
+            return {"has_followup": True, "kind": kind or "decision", "field": field, "question": question}
+
+    question = extracted_question
+    if not question:
+        return {"has_followup": False, "kind": None, "field": None, "question": None}
+
+    lowered = question.lower()
+    field = None
+    if "income" in lowered:
+        field = "monthly_income"
+    elif "expense" in lowered:
+        field = "monthly_expenses"
+    elif "saving" in lowered:
+        field = "monthly_savings"
+    elif "investment" in lowered and "existing" in lowered:
+        field = "existing_investments"
+
+    kind = "profile_field" if field else "decision"
+    return {"has_followup": True, "kind": kind, "field": field, "question": question}
+
+
+def _set_followup_tracker_from_response(session: ChatSession, assistant_response: str, turn_control: TurnControl) -> None:
+    response_text = " ".join(str(assistant_response or "").split()).strip()
+    if turn_control.self_knowledge_request:
+        _clear_followup_tracker(session, reason="self_knowledge_turn")
+        return
+    if not response_text.endswith("?"):
+        _clear_followup_tracker(session, reason="no_terminal_question")
+        return
+
+    contract = _infer_followup_contract(
+        assistant_response=response_text,
+        pending_field_hint=turn_control.pending_field,
+    )
+    if not contract.get("has_followup"):
+        _clear_followup_tracker(session, reason="no_followup_detected")
+        return
+
+    session.pending_followup_kind = str(contract.get("kind") or "decision")
+    session.pending_followup_field = contract.get("field") or turn_control.pending_field
+    session.pending_followup_question = contract.get("question")
+    session.pending_followup_created_turn = session.turn_index
+    log_event(
+        event="followup_tracker_set",
+        metadata={
+            "user_id": session.user_id,
+            "kind": session.pending_followup_kind,
+            "field": session.pending_followup_field,
+            "turn_index": session.pending_followup_created_turn,
+        },
+    )
+
+
+def _apply_followup_override(
+    session: ChatSession,
+    turn_control: TurnControl,
+    followup_used: bool,
+) -> TurnControl:
+    if not followup_used:
+        return turn_control
+
+    if turn_control.profile_updates or turn_control.self_knowledge_request or turn_control.live_data_kind:
+        return turn_control
+
+    current_kind = str(session.pending_followup_kind or "decision").strip().lower()
+    override_pending = session.pending_followup_field if _is_missing_profile_field(session.profile, session.pending_followup_field) else None
+    intent = "decision_support" if current_kind in {"profile_field", "decision"} else turn_control.routing.intent
+    financial_category = (
+        "investment_advice"
+        if current_kind in {"profile_field", "decision"} and turn_control.routing.financial_category == "general"
+        else turn_control.routing.financial_category
+    )
+    routed = QueryRouting(
+        finance_query=True,
+        small_talk=False,
+        intent=intent,
+        financial_category=financial_category,
+    )
+    updated = TurnControl(
+        routing=routed,
+        profile_updates=turn_control.profile_updates,
+        active_goal=turn_control.active_goal or session.active_goal,
+        pending_field=override_pending or turn_control.pending_field,
+        question_scope="profile_specific" if current_kind in {"profile_field", "decision"} else turn_control.question_scope,
+        self_knowledge_request=False,
+        live_data_kind=None,
+        live_data_slots={},
+    )
+    log_event(
+        event="followup_tracker_applied_override",
+        metadata={
+            "user_id": session.user_id,
+            "kind": current_kind,
+            "field": session.pending_followup_field,
+        },
+    )
+    return updated
+
+
 def _recompute_derived_financials(profile: dict, updated_field: str) -> None:
     """
     Keep derived savings coherent when income/expenses are provided in chat.
@@ -326,6 +577,29 @@ class AskVoiceRequest(BaseModel):
     audio_base64: str
     audio_mime_type: str | None = None
     audio_filename: str | None = None
+
+
+def _session_missing_voice_payload() -> dict:
+    response_text = (
+        "Your previous session is no longer active after restart. "
+        "Please initialize a new session and then ask again."
+    )
+    return {
+        "transcript": "",
+        "response_text": response_text,
+        "response_audio_base64": "",
+        "conversation_stage": "INITIAL",
+        "requires_session_init": True,
+        "timing": {
+            "stt_ms": 0.0,
+            "turn_control_ms": 0.0,
+            "text_generation_ms": 0.0,
+            "voice_render_ms": 0.0,
+            "tts_generation_ms": 0.0,
+            "other_overhead_ms": 0.0,
+            "total_request_ms": 0.0,
+        },
+    }
 
 
 # -----------------------------
@@ -397,18 +671,37 @@ def ask_question(request: AskRequest):
     if not session:
         raise HTTPException(status_code=404, detail="Invalid session")
 
+    _expire_followup_tracker_if_stale(session)
+    turn_control_input = request.message
+    followup_used = False
+    if _is_followup_tracker_active(session) and _is_terse_followup_reply(request.message):
+        turn_control_input = _augment_user_text_with_followup_context(request.message, session)
+        followup_used = True
+        log_event(
+            event="followup_tracker_used",
+            metadata={
+                "user_id": session.user_id,
+                "kind": session.pending_followup_kind,
+                "field": session.pending_followup_field,
+                "turn_index": session.turn_index,
+            },
+        )
+
     turn_control = infer_turn_control(
-        raw_query=request.message,
+        raw_query=turn_control_input,
         last_assistant_text=session.last_assistant_response,
         active_goal=session.active_goal,
         pending_field=session.pending_field,
     )
+    turn_control = _apply_followup_override(session, turn_control, followup_used=followup_used)
     turn_control, route_guard_applied, enable_live_data = _sanitize_turn_control_for_profile_flow(session, turn_control)
-    effective_query = request.message
+    effective_query = turn_control_input
     if not route_guard_applied and turn_control.live_data_kind and _should_rewrite_live_followup(turn_control):
         effective_query = _rewrite_live_followup_query(request.message, turn_control)
     _apply_turn_control(session, turn_control)
     _refresh_portfolio_collection_state(session, turn_control)
+    if followup_used:
+        _clear_followup_tracker(session, reason="consumed")
     enqueue_profile_updates(
         user_id=session.user_id,
         updates=turn_control.profile_updates,
@@ -449,6 +742,7 @@ def ask_question(request: AskRequest):
         assistant_response=response,
         memories_used=memories_used
     )
+    _set_followup_tracker_from_response(session, response, turn_control)
 
     log_event(
         event="request_timing",
@@ -458,6 +752,7 @@ def ask_question(request: AskRequest):
             "session_id": request.session_id,
             "text_generation_ms": text_generation_ms,
             "route_guard_applied": route_guard_applied,
+            "followup_tracker_used": followup_used,
             "total_request_ms": round((perf_counter() - request_start) * 1000, 2),
         },
     )
@@ -478,7 +773,12 @@ def ask_question_voice(request: AskVoiceRequest):
     session = SESSION_STORE.get(request.session_id)
 
     if not session:
-        raise HTTPException(status_code=404, detail="Invalid session")
+        log_event(
+            event="session_missing_voice_request",
+            level="WARNING",
+            metadata={"session_id": request.session_id},
+        )
+        return _session_missing_voice_payload()
 
     # 1) STT
     stt_start = perf_counter()
@@ -507,18 +807,37 @@ def ask_question_voice(request: AskVoiceRequest):
     stt_ms = round((perf_counter() - stt_start) * 1000, 2)
 
     turn_control_start = perf_counter()
+    _expire_followup_tracker_if_stale(session)
+    turn_control_input = user_text
+    followup_used = False
+    if _is_followup_tracker_active(session) and _is_terse_followup_reply(user_text):
+        turn_control_input = _augment_user_text_with_followup_context(user_text, session)
+        followup_used = True
+        log_event(
+            event="followup_tracker_used",
+            metadata={
+                "user_id": session.user_id,
+                "kind": session.pending_followup_kind,
+                "field": session.pending_followup_field,
+                "turn_index": session.turn_index,
+            },
+        )
+
     turn_control = infer_turn_control(
-        raw_query=user_text,
+        raw_query=turn_control_input,
         last_assistant_text=session.last_assistant_response,
         active_goal=session.active_goal,
         pending_field=session.pending_field,
     )
+    turn_control = _apply_followup_override(session, turn_control, followup_used=followup_used)
     turn_control, route_guard_applied, enable_live_data = _sanitize_turn_control_for_profile_flow(session, turn_control)
-    effective_query = user_text
+    effective_query = turn_control_input
     if not route_guard_applied and turn_control.live_data_kind and _should_rewrite_live_followup(turn_control):
         effective_query = _rewrite_live_followup_query(user_text, turn_control)
     _apply_turn_control(session, turn_control)
     _refresh_portfolio_collection_state(session, turn_control)
+    if followup_used:
+        _clear_followup_tracker(session, reason="consumed")
     enqueue_profile_updates(
         user_id=session.user_id,
         updates=turn_control.profile_updates,
@@ -569,6 +888,7 @@ def ask_question_voice(request: AskVoiceRequest):
         assistant_response=response,
         memories_used=memories_used
     )
+    _set_followup_tracker_from_response(session, response, turn_control)
 
     # 4) TTS
     tts_start = perf_counter()
@@ -594,6 +914,7 @@ def ask_question_voice(request: AskVoiceRequest):
             "other_overhead_ms": other_overhead_ms,
             "total_request_ms": total_request_ms,
             "route_guard_applied": route_guard_applied,
+            "followup_tracker_used": followup_used,
         },
     )
 

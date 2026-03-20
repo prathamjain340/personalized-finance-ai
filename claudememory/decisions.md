@@ -2,6 +2,16 @@
 
 Last updated: 2026-03-17
 
+## 2026-03-17 - Commodity Live Data + Stock History Web Fallback
+- Added `commodity` as a new live_data_kind in intent.py and live_data_service.py.
+- commodity kind has no structured provider → registry returns [] → structured chain returns error → existing web fallback (DuckDuckGo) runs automatically with the user's original query.
+- Removed `needs_input` from `_PROVIDER_SUCCESS_STATUSES` so failed equity resolution (e.g. unrecognized company names) falls through to web fallback instead of stopping.
+- No hardcoded commodity names or ticker symbols — LLM classifies kind, web search resolves price.
+
+Rationale:
+- Silver/oil/platinum queries were being classified as `education` and answered with hallucinated prices.
+- Tesla stock history was failing silently because `needs_input` was treated as a provider success.
+
 ## 2026-03-17 - Generalized Live Provider Chain + Reliability Gates
 - Replaced direct per-kind live fetch branching with a generalized provider-chain registry for all live kinds.
 - Added chain-level telemetry (`provider_attempts`, `failure_reason`) and standardized fallback outcomes (`fallback_ok`, `fallback_empty`, `provider_failed`).
@@ -99,22 +109,3 @@ Rationale:
 Rationale:
 - User validated that cutoff quality is a higher pain point than incremental latency.
 - Better complete responses reduce perceived errors even with modestly higher response time.
-
-## 2026-03-18 - Self-Knowledge Response Rollback (Normal Profile Style)
-- Re-centered self-knowledge replies on stable profile + personal interests/preferences.
-- Kept goals hidden by default in profile-style self-knowledge responses unless explicit goal focus is requested.
-- Increased self-knowledge memory candidate/selection breadth to improve recall diversity for hobbies/interests.
-- Removed newly added phrase-based hardcoded checks from self-knowledge focus gating; focus fallback is model-driven with neutral default.
-
-Rationale:
-- User preference: "What do you know about me?" should sound like normal profile memory, not assistant-suggestion recall.
-- User explicitly requested avoiding hardcoded behavior.
-
-## 2026-03-19 - Assistant-Note Isolation + Bounded Storage
-- Added model-gated inclusion for `assistant_note` retrieval in self-knowledge flow, so profile fetches do not accidentally pull assistant response notes.
-- Added fallback behavior: if focus predicts `assistant_recall` but no assistant notes are retrieved, response falls back to profile-style memory output.
-- Compacted assistant-note content length and added pruning to keep only the most recent 20 assistant-note records per user.
-
-Rationale:
-- Logs showed profile requests still leaking assistant suggestions.
-- Long conversations should not cause unbounded assistant-note memory growth.

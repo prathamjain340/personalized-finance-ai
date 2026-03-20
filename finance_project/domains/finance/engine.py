@@ -2,7 +2,9 @@
 # This file is the brainstem of your system
 # app/domains/finance/engine.py
 
-from typing import Optional
+import json
+from typing import Any, Optional
+import datetime
 import re
 
 from finance_project.domains.finance.intent import (
@@ -14,15 +16,17 @@ from finance_project.domains.finance.prompt.assembler import (
     assemble_out_of_domain_prompt,
     assemble_prompt,
 )
-from finance_project.domains.finance.reflection import reflect_on_response
+from finance_project.domains.finance.reflection import reflect_on_response_with_audit
 
 from finance_project.core.summary.repository import get_domain_summary
 from finance_project.core.profile.repository import get_profile, merge_profiles
 from finance_project.core.memory.retriever import retrieve_memories
 from finance_project.core.llm.client import generate_response
-from finance_project.core.logging.logger import log_conversation
+from finance_project.core.logging.logger import log_conversation, log_event
 from finance_project.domains.finance.safety import select_response_mode
 from finance_project.core.postprocess.dispatcher import enqueue_memory_candidates
+from finance_project.core.memory.store import store_memory
+from finance_project.core.storage.sqlite_db import get_connection, init_db
 from finance_project.domains.finance.signals import compute_financial_signals
 from finance_project.domains.finance.profile.gap_analyzer import analyze_profile_gaps, ProfileDataState
 from finance_project.core.chat.stage import ConversationStage
@@ -72,6 +76,7 @@ class FinanceEngine:
             question_scope = "general"
 
         query_for_routing = current_query or raw_query
+        current_utterance = self._extract_current_utterance(query_for_routing)
 
         live_data = None
         if enable_live_data:
@@ -89,16 +94,18 @@ class FinanceEngine:
                 profile=profile,
                 apply_voice_trim=apply_voice_trim,
             )
-            memory_candidates = reflect_on_response(
+            memory_audit = self._capture_memory_candidates(
                 user_id=user_id,
-                raw_query=query_for_routing,
+                raw_query=current_utterance,
                 response=response,
                 intent="live_data",
             )
-            enqueue_memory_candidates(
+            assistant_note_stored_count = self._store_assistant_note(
                 user_id=user_id,
-                domain="finance",
-                memory_candidates=memory_candidates,
+                response=response,
+                intent="live_data",
+                financial_category=str(live_data.get("kind") or "general"),
+                pending_field=None,
             )
             log_conversation(
                 user_id=user_id,
@@ -114,6 +121,9 @@ class FinanceEngine:
                     "ambiguity_clarification": bool(live_data.get("ambiguity_clarification")),
                     "live_failure_reason": live_data.get("failure_reason"),
                     "provider_attempts_count": len(live_data.get("provider_attempts") or []),
+                    "memory_extracted_count": memory_audit.get("extracted_count", 0),
+                    "memory_stored_count": memory_audit.get("stored_count", 0),
+                    "assistant_note_stored_count": assistant_note_stored_count,
                 },
             )
             return response, []
@@ -125,12 +135,27 @@ class FinanceEngine:
             )
 
         if self_knowledge_request:
+            self_knowledge_focus = self._infer_self_knowledge_focus(current_utterance)
+            include_assistant_notes = (
+                self_knowledge_focus == "assistant_recall"
+                and self._should_include_assistant_notes_for_query(current_utterance)
+            )
             memories = retrieve_memories(
                 user_id=user_id,
                 domain="finance",
-                query=query_for_routing,
+                query=current_utterance,
                 session_memory_usage=session_memory_usage,
-                limit=8,
+                limit=28,
+                allow_exposure_reuse=True,
+                preferred_types=self._preferred_memory_types_for_focus(self_knowledge_focus),
+                candidate_scan_limit=160,
+                include_assistant_notes=include_assistant_notes,
+            )
+            selected_memories, selection_breakdown, goals_suppressed = self._select_self_knowledge_memories(
+                utterance=current_utterance,
+                memories=memories,
+                focus=self_knowledge_focus,
+                limit=7,
             )
             profile_snapshot = self._refresh_profile_snapshot(
                 user_id=user_id,
@@ -138,8 +163,9 @@ class FinanceEngine:
             )
             response = self._build_self_knowledge_response(
                 profile=profile_snapshot,
-                memories=memories,
+                memories=selected_memories,
                 response_channel=response_channel,
+                focus=self_knowledge_focus,
             )
             log_conversation(
                 user_id=user_id,
@@ -149,16 +175,19 @@ class FinanceEngine:
                 metadata={
                     "intent": "self_knowledge",
                     "profile_fields_count": self._non_empty_profile_fields_count(profile_snapshot),
-                    "memory_count": len(memories),
+                    "memory_count": len(selected_memories),
+                    "self_knowledge_focus": self_knowledge_focus,
+                    "self_knowledge_selection_breakdown": selection_breakdown,
+                    "self_knowledge_goal_suppressed": goals_suppressed,
                 },
             )
-            return response, memories
+            return response, selected_memories
 
         if not routing.finance_query:
             memories = retrieve_memories(
                 user_id=user_id,
                 domain="finance",
-                query=query_for_routing,
+                query=current_utterance,
                 session_memory_usage=session_memory_usage,
                 limit=3,
             )
@@ -176,23 +205,31 @@ class FinanceEngine:
                 response_channel=response_channel,
                 apply_voice_trim=apply_voice_trim,
             )
-            memory_candidates = reflect_on_response(
+            memory_audit = self._capture_memory_candidates(
                 user_id=user_id,
-                raw_query=query_for_routing,
+                raw_query=current_utterance,
                 response=response,
                 intent="out_of_domain",
             )
-            enqueue_memory_candidates(
+            assistant_note_stored_count = self._store_assistant_note(
                 user_id=user_id,
-                domain="finance",
-                memory_candidates=memory_candidates,
+                response=response,
+                intent="out_of_domain",
+                financial_category=routing.financial_category,
+                pending_field=pending_field,
             )
             log_conversation(
                 user_id=user_id,
                 domain="finance",
                 request=raw_query,
                 response=response,
-                metadata={"intent": "out_of_domain", "small_talk": routing.small_talk},
+                metadata={
+                    "intent": "out_of_domain",
+                    "small_talk": routing.small_talk,
+                    "memory_extracted_count": memory_audit.get("extracted_count", 0),
+                    "memory_stored_count": memory_audit.get("stored_count", 0),
+                    "assistant_note_stored_count": assistant_note_stored_count,
+                },
             )
             return response, memories
 
@@ -216,7 +253,7 @@ class FinanceEngine:
         memories = retrieve_memories(
             user_id=user_id,
             domain="finance",
-            query=query_for_routing,
+            query=current_utterance,
             session_memory_usage=session_memory_usage,
             limit=3,
         )
@@ -247,12 +284,32 @@ class FinanceEngine:
                 response_channel=response_channel,
                 apply_voice_trim=apply_voice_trim,
             )
+            memory_audit = self._capture_memory_candidates(
+                user_id=user_id,
+                raw_query=current_utterance,
+                response=response,
+                intent=intent,
+            )
+            assistant_note_stored_count = self._store_assistant_note(
+                user_id=user_id,
+                response=response,
+                intent=intent,
+                financial_category=financial_category,
+                pending_field=missing_fields[0] if missing_fields else pending_field,
+            )
             log_conversation(
                 user_id=user_id,
                 domain="finance",
                 request=raw_query,
                 response=response,
-                metadata={"intent": intent, "profile_state": profile_state.value, "missing_fields": missing_fields},
+                metadata={
+                    "intent": intent,
+                    "profile_state": profile_state.value,
+                    "missing_fields": missing_fields,
+                    "memory_extracted_count": memory_audit.get("extracted_count", 0),
+                    "memory_stored_count": memory_audit.get("stored_count", 0),
+                    "assistant_note_stored_count": assistant_note_stored_count,
+                },
             )
             return response, []
 
@@ -286,6 +343,20 @@ class FinanceEngine:
         )
 
         # 7. Log conversation (immutable)
+        memory_audit = self._capture_memory_candidates(
+            user_id=user_id,
+            raw_query=current_utterance,
+            response=response,
+            intent=intent,
+        )
+        assistant_note_stored_count = self._store_assistant_note(
+            user_id=user_id,
+            response=response,
+            intent=intent,
+            financial_category=financial_category,
+            pending_field=pending_field,
+        )
+
         log_conversation(
             user_id=user_id,
             domain="finance",
@@ -298,21 +369,10 @@ class FinanceEngine:
                 "profile_state": profile_state.value,
                 "active_goal": active_goal,
                 "pending_field": pending_field,
+                "memory_extracted_count": memory_audit.get("extracted_count", 0),
+                "memory_stored_count": memory_audit.get("stored_count", 0),
+                "assistant_note_stored_count": assistant_note_stored_count,
             },
-        )
-
-        # 8. Post-response reflection (non-blocking, probabilistic)
-        memory_candidates = reflect_on_response(
-            user_id=user_id,
-            raw_query=query_for_routing,
-            response=response,
-            intent=intent,
-        )
-
-        enqueue_memory_candidates(
-            user_id=user_id,
-            domain="finance",
-            memory_candidates=memory_candidates,
         )
 
         return response, memories
@@ -496,6 +556,12 @@ class FinanceEngine:
             response = self._format_crypto_history_update(facts=facts, as_of=as_of)
         elif kind == "gold":
             response = self._format_gold_update(facts=facts, as_of=as_of)
+        elif kind == "commodity":
+            response = self._format_gold_update(facts=facts, as_of=as_of)
+        elif kind == "gold_history":
+            response = self._format_stock_history_update(facts=facts, as_of=as_of)
+        elif kind == "commodity_history":
+            response = self._format_stock_history_update(facts=facts, as_of=as_of)
         elif kind == "fx":
             response = self._format_fx_update(facts=facts, as_of=as_of)
         elif kind == "news":
@@ -537,18 +603,21 @@ class FinanceEngine:
         price = FinanceEngine._first_fact_value(facts, "Last price:")
         change = FinanceEngine._first_fact_value(facts, "Change:")
 
-        parts = []
-        if instrument:
-            parts.append(f"{instrument}")
-        if price:
-            parts.append(f"last price is {price}")
-        if change:
-            parts.append(f"change is {change}")
+        label = FinanceEngine._ticker_to_label(instrument) if instrument else None
+        price_clean = FinanceEngine._clean_price(price) if price else None
 
-        body = ", ".join(parts) if parts else "Here is the latest stock update."
-        freshness = FinanceEngine._freshness_suffix(as_of)
+        if label and price_clean:
+            body = f"{label} is currently at {price_clean}"
+        elif label:
+            body = f"Here is the latest update for {label}"
+        else:
+            body = "Here is the latest stock update."
+
+        if change:
+            body += f", with a change of {FinanceEngine._clean_price(change)}"
+
         caution = " This is market data, not a buy or sell recommendation."
-        return f"{body}.{freshness}{caution}"
+        return f"{body}.{caution}"
 
     @staticmethod
     def _format_stock_history_update(facts: list[str], as_of: str) -> str:
@@ -558,42 +627,48 @@ class FinanceEngine:
         end_price = FinanceEngine._first_fact_value(facts, "End price:")
         total_return = FinanceEngine._first_fact_value(facts, "Total return:")
 
-        parts = []
-        if instrument:
-            parts.append(f"{instrument}")
-        if period:
-            parts.append(f"period is {period}")
-        if start_price and end_price:
-            parts.append(f"start price {start_price}, end price {end_price}")
-        if total_return:
-            parts.append(f"total return {total_return}")
+        label = FinanceEngine._ticker_to_label(instrument) if instrument else None
+        period_clean = FinanceEngine._clean_period(period) if period else None
+        start_clean = FinanceEngine._clean_price(start_price) if start_price else None
+        end_clean = FinanceEngine._clean_price(end_price) if end_price else None
+        return_clean = FinanceEngine._clean_return(total_return) if total_return else None
 
-        body = ", ".join(parts) if parts else "Here is the historical stock performance."
-        freshness = FinanceEngine._freshness_suffix(as_of)
+        if label and start_clean and end_clean and period_clean and return_clean:
+            body = f"{label} went from {start_clean} to {end_clean} between {period_clean}, a total return of {return_clean}"
+        elif label and start_clean and end_clean and return_clean:
+            body = f"{label} moved from {start_clean} to {end_clean}, a total return of {return_clean}"
+        elif label and return_clean:
+            body = f"{label} had a total return of {return_clean}"
+        else:
+            body = "Here is the historical performance."
+
         caution = " This is market data, not a buy or sell recommendation."
-        return f"{body}.{freshness}{caution}"
+        return f"{body}.{caution}"
 
     @staticmethod
     def _format_crypto_update(facts: list[str], as_of: str) -> str:
         instrument = FinanceEngine._first_fact_value(facts, "Instrument:")
         usd_price = FinanceEngine._first_fact_value(facts, "Last price:")
-        inr_price = FinanceEngine._first_fact_value(facts, "Last price INR:")
         day_change = FinanceEngine._first_fact_value(facts, "24h change:")
 
-        parts = []
-        if instrument:
-            parts.append(instrument)
-        if usd_price:
-            parts.append(f"price is {usd_price}")
-        if inr_price:
-            parts.append(f"inr price is {inr_price}")
-        if day_change:
-            parts.append(f"24 hour change is {day_change}")
+        inr_price = FinanceEngine._first_fact_value(facts, "Last price INR:")
+        label = FinanceEngine._ticker_to_label(instrument) if instrument else None
+        price_clean = FinanceEngine._clean_price(usd_price) if usd_price else None
 
-        body = ", ".join(parts) if parts else "Here is the latest crypto update."
-        freshness = FinanceEngine._freshness_suffix(as_of)
+        if label and inr_price:
+            body = f"{label} is currently at {inr_price} rupees"
+        elif label and price_clean:
+            body = f"{label} is currently at {price_clean}"
+        elif label:
+            body = f"Here is the latest update for {label}"
+        else:
+            body = "Here is the latest crypto update."
+
+        if day_change:
+            body += f", with a 24 hour change of {FinanceEngine._clean_return(day_change)}"
+
         caution = " This is market data, not a buy or sell recommendation."
-        return f"{body}.{freshness}{caution}"
+        return f"{body}.{caution}"
 
     @staticmethod
     def _format_crypto_history_update(facts: list[str], as_of: str) -> str:
@@ -603,20 +678,21 @@ class FinanceEngine:
         end_price = FinanceEngine._first_fact_value(facts, "End price:")
         total_return = FinanceEngine._first_fact_value(facts, "Total return:")
 
-        parts = []
-        if instrument:
-            parts.append(instrument)
-        if period:
-            parts.append(f"period is {period}")
-        if start_price and end_price:
-            parts.append(f"start price {start_price}, end price {end_price}")
-        if total_return:
-            parts.append(f"total return {total_return}")
+        label = FinanceEngine._ticker_to_label(instrument) if instrument else None
+        period_clean = FinanceEngine._clean_period(period) if period else None
+        start_clean = FinanceEngine._clean_price(start_price) if start_price else None
+        end_clean = FinanceEngine._clean_price(end_price) if end_price else None
+        return_clean = FinanceEngine._clean_return(total_return) if total_return else None
 
-        body = ", ".join(parts) if parts else "Here is the historical crypto performance."
-        freshness = FinanceEngine._freshness_suffix(as_of)
+        if label and start_clean and end_clean and period_clean and return_clean:
+            body = f"{label} went from {start_clean} to {end_clean} between {period_clean}, a total return of {return_clean}"
+        elif label and return_clean:
+            body = f"{label} had a total return of {return_clean}"
+        else:
+            body = "Here is the historical crypto performance."
+
         caution = " This is market data, not a buy or sell recommendation."
-        return f"{body}.{freshness}{caution}"
+        return f"{body}.{caution}"
 
     @staticmethod
     def _format_gold_update(facts: list[str], as_of: str) -> str:
@@ -624,37 +700,43 @@ class FinanceEngine:
         price = FinanceEngine._first_fact_value(facts, "Last price:")
         change = FinanceEngine._first_fact_value(facts, "Change:")
 
-        parts = []
-        if instrument:
-            parts.append(instrument)
-        if price:
-            parts.append(f"price is {price}")
-        if change:
-            parts.append(f"change is {change}")
+        inr_10g = FinanceEngine._first_fact_value(facts, "Last price INR per 10g:")
+        inr_price = FinanceEngine._first_fact_value(facts, "Last price INR:")
+        label = FinanceEngine._ticker_to_label(instrument) if instrument else None
+        price_clean = FinanceEngine._clean_price(price) if price else None
 
-        body = ", ".join(parts) if parts else "Here is the latest gold update."
-        freshness = FinanceEngine._freshness_suffix(as_of)
+        if label and inr_10g:
+            body = f"{label} is currently at {inr_10g} rupees per 10 grams"
+        elif label and inr_price:
+            body = f"{label} is currently at {inr_price} rupees per troy ounce"
+        elif label and price_clean:
+            body = f"{label} is currently at {price_clean}"
+        elif label:
+            body = f"Here is the latest update for {label}"
+        else:
+            body = "Here is the latest commodity update."
+
+        if change:
+            body += f", with a change of {FinanceEngine._clean_price(change)}"
+
         caution = " This is market data, not a buy or sell recommendation."
-        return f"{body}.{freshness}{caution}"
+        return f"{body}.{caution}"
 
     @staticmethod
     def _format_fx_update(facts: list[str], as_of: str) -> str:
         pair = FinanceEngine._first_fact_value(facts, "Pair:")
         rate = FinanceEngine._first_fact_value(facts, "Rate:")
-        date = FinanceEngine._first_fact_value(facts, "Date:")
 
-        parts = []
-        if pair:
-            parts.append(f"for {pair}")
-        if rate:
-            parts.append(rate)
-        if date:
-            parts.append(f"dated {date}")
+        if pair and rate:
+            rate_clean = FinanceEngine._clean_price(rate)
+            body = f"The exchange rate for {pair} is {rate_clean}"
+        elif pair:
+            body = f"Here is the latest exchange rate for {pair}"
+        else:
+            body = "Here is the latest forex update."
 
-        body = ", ".join(parts) if parts else "Here is the latest forex update."
-        freshness = FinanceEngine._freshness_suffix(as_of)
         caution = " This is market data, not a buy or sell recommendation."
-        return f"{body}.{freshness}{caution}"
+        return f"{body}.{caution}"
 
     @staticmethod
     def _format_news_update(facts: list[str], as_of: str) -> str:
@@ -682,74 +764,533 @@ class FinanceEngine:
         return None
 
     @staticmethod
+    def _ticker_to_label(ticker: str) -> str:
+        """Convert a raw ticker/symbol to a human-readable name."""
+        _KNOWN = {
+            "xauusd": "Gold", "xagusd": "Silver", "xptusd": "Platinum",
+            "xpdusd": "Palladium", "xrhusd": "Rhodium",
+        }
+        t = str(ticker or "").strip()
+        lower = t.lower()
+        if lower in _KNOWN:
+            return _KNOWN[lower]
+        # Strip common exchange suffixes (.us, .in, .ns, .bo, .l, etc.)
+        clean = re.sub(r"\.(us|in|ns|bo|l|pa|de|hk|ax|to)$", "", lower, flags=re.IGNORECASE)
+        return clean.upper() if clean else t
+
+    @staticmethod
+    def _clean_price(value_str: str) -> str:
+        """Round and format a price string: '1978.36 USD' → '1,978 USD', '80.13' → '80'."""
+        text = str(value_str or "").strip()
+        m = re.match(r"^([+-]?[0-9,]+(?:\.[0-9]*)?)(.*)$", text)
+        if not m:
+            return text
+        num_part = m.group(1).replace(",", "")
+        suffix = m.group(2).strip()
+        try:
+            val = float(num_part)
+        except ValueError:
+            return text
+        rounded = round(val)
+        formatted = f"{rounded:,}"
+        return f"{formatted} {suffix}".strip() if suffix else formatted
+
+    @staticmethod
+    def _clean_return(value_str: str) -> str:
+        """'115.86%' → 'about 116 percent', '-5.2%' → 'about -5 percent'."""
+        text = str(value_str or "").strip()
+        m = re.match(r"^([+-]?\s*[0-9]+(?:\.[0-9]*)?)%?", text)
+        if not m:
+            return text
+        try:
+            val = float(m.group(1).replace(" ", ""))
+        except ValueError:
+            return text
+        rounded = round(val)
+        return f"about {rounded} percent"
+
+    @staticmethod
+    def _clean_period(period_str: str) -> str:
+        """'2023-03-20 to 2026-03-16' → 'March 2023 to March 2026'."""
+        text = str(period_str or "").strip()
+        m = re.match(r"^(\d{4}-\d{2}-\d{2})\s+to\s+(\d{4}-\d{2}-\d{2})$", text)
+        if not m:
+            return text
+        _MONTHS = ["January", "February", "March", "April", "May", "June",
+                   "July", "August", "September", "October", "November", "December"]
+        try:
+            d1 = datetime.date.fromisoformat(m.group(1))
+            d2 = datetime.date.fromisoformat(m.group(2))
+            return f"{_MONTHS[d1.month - 1]} {d1.year} to {_MONTHS[d2.month - 1]} {d2.year}"
+        except Exception:
+            return text
+
+    @staticmethod
     def _freshness_suffix(as_of: str) -> str:
-        if not as_of:
-            return ""
-        return f" Data as of {as_of}"
+        return ""
 
     @staticmethod
     def _memory_text_tokens(text: str) -> set[str]:
         return {token for token in re.findall(r"[a-z0-9]+", text.lower()) if len(token) >= 3}
 
     @staticmethod
-    def _prepare_self_knowledge_memory_lines(memories: list, limit: int = 6) -> list[str]:
-        entries: list[dict] = []
-        for memory in memories[:10]:
-            memory_type = str(getattr(memory, "type", "") or "").strip().lower()
-            content = str(getattr(memory, "content", "")).strip()
-            if not content:
-                continue
-            if content.lower().startswith("user "):
-                content = content[5:]
-            content = content[:1].upper() + content[1:] if content else content
-            line = content[:120].strip()
-            if not line:
-                continue
-            normalized = re.sub(r"\s+", " ", line.lower()).strip(" .,!?:;")
-            tokens = FinanceEngine._memory_text_tokens(normalized)
-            entries.append(
-                {
-                    "type": memory_type,
-                    "line": line,
-                    "norm": normalized,
-                    "tokens": tokens,
-                }
+    def _split_sentences(text: str) -> list[str]:
+        normalized = " ".join(str(text or "").split()).strip()
+        if not normalized:
+            return []
+        parts = [segment.strip() for segment in re.split(r"(?<=[.!?])\s+", normalized) if segment.strip()]
+        return parts or [normalized]
+
+    @staticmethod
+    def _extract_last_question(text: str) -> str | None:
+        sentences = FinanceEngine._split_sentences(text)
+        for sentence in reversed(sentences):
+            if sentence.endswith("?"):
+                return sentence
+        return None
+
+    @staticmethod
+    def _build_assistant_note_content(
+        response: str,
+        intent: str,
+        financial_category: str | None = None,
+        pending_field: str | None = None,
+    ) -> str | None:
+        normalized = " ".join(str(response or "").split()).strip()
+        if not normalized:
+            return None
+
+        sentences = FinanceEngine._split_sentences(normalized)
+        if not sentences:
+            return None
+
+        summary_sentence = ""
+        for sentence in sentences:
+            if not sentence.endswith("?"):
+                summary_sentence = sentence
+                break
+        if not summary_sentence:
+            summary_sentence = sentences[0]
+
+        summary_sentence = summary_sentence.strip()
+        if len(summary_sentence) > 96:
+            summary_sentence = summary_sentence[:96].rstrip(" ,;:") + "."
+
+        pending_question = FinanceEngine._extract_last_question(normalized)
+        if pending_question and len(pending_question) > 96:
+            pending_question = pending_question[:96].rstrip(" ,;:") + "?"
+
+        topic = str(financial_category or intent or "general").strip().lower()
+        if not topic:
+            topic = "general"
+
+        components = [f"topic={topic}", f"summary={summary_sentence}"]
+        if pending_field:
+            components.append(f"pending_field={pending_field}")
+        if pending_question:
+            components.append(f"pending_question={pending_question}")
+        return "; ".join(components)
+
+    @staticmethod
+    def _should_include_assistant_notes_for_query(utterance: str) -> bool:
+        text = str(utterance or "").strip()
+        if not text:
+            return False
+
+        prompt = (
+            "Determine whether the user is explicitly asking to recall prior assistant suggestions/advice.\n"
+            "Return STRICT JSON only with key 'include_assistant_notes' as true or false.\n"
+            "Use true only when the user clearly asks what the assistant suggested/recommended earlier.\n"
+            f"User message: {text}"
+        )
+        raw = generate_response(prompt, operation="turn_control")
+        payload = FinanceEngine._extract_json_payload(raw)
+        if isinstance(payload, dict):
+            return bool(payload.get("include_assistant_notes"))
+        return False
+
+    @staticmethod
+    def _prune_assistant_notes(user_id: str, keep: int = 20) -> int:
+        keep_limit = max(5, int(keep))
+        try:
+            init_db()
+            with get_connection() as conn:
+                cursor = conn.execute(
+                    """
+                    DELETE FROM user_memories
+                    WHERE user_id = ?
+                      AND domain = 'finance'
+                      AND type = 'assistant_note'
+                      AND id NOT IN (
+                          SELECT id
+                          FROM user_memories
+                          WHERE user_id = ?
+                            AND domain = 'finance'
+                            AND type = 'assistant_note'
+                          ORDER BY updated_at DESC
+                          LIMIT ?
+                      )
+                    """,
+                    (user_id, user_id, keep_limit),
+                )
+                return int(cursor.rowcount or 0)
+        except Exception:
+            return 0
+
+    def _store_assistant_note(
+        self,
+        user_id: str,
+        response: str,
+        intent: str,
+        financial_category: str | None = None,
+        pending_field: str | None = None,
+    ) -> int:
+        # Keep these notes focused on assistant guidance, not on social chatter or self-knowledge echoes.
+        if str(intent or "").strip().lower() in {"self_knowledge", "out_of_domain"}:
+            log_event(
+                event="assistant_note_pipeline_audit",
+                metadata={
+                    "user_id": user_id,
+                    "intent": intent,
+                    "extracted_count": 0,
+                    "stored_count": 0,
+                    "dropped_reason": "intent_filtered",
+                },
+            )
+            return 0
+
+        content = self._build_assistant_note_content(
+            response=response,
+            intent=intent,
+            financial_category=financial_category,
+            pending_field=pending_field,
+        )
+        if not content:
+            log_event(
+                event="assistant_note_pipeline_audit",
+                metadata={
+                    "user_id": user_id,
+                    "intent": intent,
+                    "extracted_count": 0,
+                    "stored_count": 0,
+                    "dropped_reason": "empty_content",
+                },
+            )
+            return 0
+
+        stored_count = 0
+        try:
+            stored = store_memory(
+                user_id=user_id,
+                domain="finance",
+                memory={
+                    "type": "assistant_note",
+                    "content": content,
+                    "confidence": 0.72,
+                    "importance": 0.6,
+                },
+            )
+            if stored is not None:
+                stored_count = 1
+        except Exception:
+            stored_count = 0
+
+        pruned_count = 0
+        if stored_count:
+            pruned_count = self._prune_assistant_notes(user_id=user_id, keep=20)
+
+        log_event(
+            event="assistant_note_pipeline_audit",
+            metadata={
+                "user_id": user_id,
+                "intent": intent,
+                "extracted_count": 1,
+                "stored_count": stored_count,
+                "pruned_count": pruned_count,
+            },
+        )
+        return stored_count
+
+    def _capture_memory_candidates(
+        self,
+        user_id: str,
+        raw_query: str,
+        response: str,
+        intent: str,
+    ) -> dict[str, Any]:
+        result = reflect_on_response_with_audit(
+            user_id=user_id,
+            raw_query=raw_query,
+            response=response,
+            intent=intent,
+        )
+        candidates = list(result.get("memory_candidates") or [])
+        audit = dict(result.get("audit") or {})
+        dropped = dict(audit.get("dropped_reason_counts") or {})
+
+        sync_types = {"goal", "preference", "interest", "dislike"}
+        sync_candidates: list[dict] = []
+        async_candidates: list[dict] = []
+        for item in candidates:
+            memory_type = str(item.get("type") or "").strip().lower()
+            if memory_type in sync_types:
+                sync_candidates.append(item)
+            else:
+                async_candidates.append(item)
+
+        stored_sync = 0
+        sync_failures = 0
+        for candidate in sync_candidates:
+            try:
+                stored = store_memory(user_id=user_id, domain="finance", memory=candidate)
+                if stored is not None:
+                    stored_sync += 1
+                else:
+                    sync_failures += 1
+            except Exception:
+                sync_failures += 1
+
+        if sync_failures:
+            dropped["sync_store_failed"] = dropped.get("sync_store_failed", 0) + sync_failures
+
+        queued_async = len(async_candidates)
+        if async_candidates:
+            enqueue_memory_candidates(
+                user_id=user_id,
+                domain="finance",
+                memory_candidates=async_candidates,
             )
 
-        entries.sort(key=lambda item: len(item["norm"]))
-        compact: list[dict] = []
+        summary = {
+            "source": audit.get("source"),
+            "extracted_count": int(audit.get("deduped_count", len(candidates))),
+            "stored_count": stored_sync + queued_async,
+            "stored_sync_count": stored_sync,
+            "queued_async_count": queued_async,
+            "dropped_reason_counts": dropped,
+        }
+        log_event(
+            event="memory_pipeline_audit",
+            metadata={
+                "user_id": user_id,
+                "intent": intent,
+                "source": summary["source"],
+                "extracted_count": summary["extracted_count"],
+                "stored_count": summary["stored_count"],
+                "stored_sync_count": summary["stored_sync_count"],
+                "queued_async_count": summary["queued_async_count"],
+                "dropped_reason_counts": summary["dropped_reason_counts"],
+            },
+        )
+        return summary
 
-        for entry in entries:
-            duplicate = False
-            for kept in compact:
-                if entry["type"] != kept["type"]:
-                    continue
+    @staticmethod
+    def _extract_json_payload(raw_text: str) -> dict | None:
+        if not raw_text:
+            return None
+        text = raw_text.strip()
+        try:
+            payload = json.loads(text)
+            if isinstance(payload, dict):
+                return payload
+        except json.JSONDecodeError:
+            pass
 
-                if not entry["norm"] or entry["norm"] == kept["norm"]:
-                    duplicate = True
-                    break
+        match = re.search(r"\{[\s\S]*\}", text)
+        if not match:
+            return None
+        try:
+            payload = json.loads(match.group(0))
+            return payload if isinstance(payload, dict) else None
+        except json.JSONDecodeError:
+            return None
 
-                # If the new line only extends an existing shorter line, skip it.
-                if kept["norm"] in entry["norm"]:
-                    duplicate = True
-                    break
+    @staticmethod
+    def _infer_self_knowledge_focus(utterance: str) -> str:
+        text = str(utterance or "").strip()
+        if not text:
+            return "profile"
 
-                entry_tokens = entry["tokens"]
-                kept_tokens = kept["tokens"]
-                if entry_tokens and kept_tokens:
-                    union = entry_tokens | kept_tokens
-                    if union:
-                        jaccard = len(entry_tokens & kept_tokens) / len(union)
-                        if jaccard >= 0.85:
-                            duplicate = True
-                            break
+        prompt = (
+            "Classify the user's self-knowledge question focus.\n"
+            "Return STRICT JSON only with key 'focus'.\n"
+            "Allowed values: general, profile, goal, interest, assistant_recall.\n"
+            "Use 'interest' for hobbies/likes/dislikes/preferences.\n"
+            "Use 'assistant_recall' when the user asks what the assistant suggested/recommended earlier.\n"
+            f"User message: {text}"
+        )
+        raw = generate_response(prompt, operation="turn_control")
+        payload = FinanceEngine._extract_json_payload(raw)
+        if isinstance(payload, dict):
+            focus = str(payload.get("focus") or "").strip().lower()
+            if focus in {"general", "profile", "goal", "interest", "assistant_recall"}:
+                return focus
 
-            if not duplicate:
-                compact.append(entry)
-            if len(compact) >= limit:
+        return "profile"
+
+    @staticmethod
+    def _preferred_memory_types_for_focus(focus: str) -> list[str]:
+        if focus == "assistant_recall":
+            return ["assistant_note"]
+        if focus == "interest":
+            return ["interest", "preference", "dislike"]
+        if focus == "goal":
+            return ["goal", "interest", "preference"]
+        if focus == "profile":
+            return ["interest", "preference", "dislike", "behavioral"]
+        return ["interest", "preference", "dislike", "behavioral"]
+
+    @staticmethod
+    def _select_self_knowledge_memories(
+        utterance: str,
+        memories: list,
+        focus: str,
+        limit: int = 5,
+    ) -> tuple[list, dict[str, int], bool]:
+        _ = utterance
+        interest_types = {"interest", "preference", "dislike", "hobby"}
+        goal_types = {"goal"}
+        behavioral_types = {"behavioral", "emotional"}
+        assistant_note_types = {"assistant_note"}
+
+        goals = [m for m in memories if str(getattr(m, "type", "") or "").lower() in goal_types]
+        interests = [m for m in memories if str(getattr(m, "type", "") or "").lower() in interest_types]
+        behavioral = [m for m in memories if str(getattr(m, "type", "") or "").lower() in behavioral_types]
+        assistant_notes = [m for m in memories if str(getattr(m, "type", "") or "").lower() in assistant_note_types]
+        other = [
+            m
+            for m in memories
+            if str(getattr(m, "type", "") or "").lower()
+            not in (goal_types | interest_types | behavioral_types | assistant_note_types)
+        ]
+        goals_suppressed = focus in {"general", "profile", "interest", "assistant_recall"} and bool(goals)
+
+        ordered: list = []
+        fallback_pool: list = []
+        if focus == "assistant_recall":
+            ordered.extend(assistant_notes[:4])
+            fallback_pool = assistant_notes + other
+        elif focus == "interest":
+            ordered.extend(interests[:3])
+            ordered.extend(behavioral[:1])
+            fallback_pool = interests + behavioral + other
+        elif focus == "goal":
+            ordered.extend(goals[:2])
+            ordered.extend(interests[:2])
+            ordered.extend(behavioral[:1])
+            fallback_pool = goals + interests + behavioral + other
+        elif focus == "profile":
+            ordered.extend(interests[:2])
+            ordered.extend(behavioral[:1])
+            ordered.extend(other[:1])
+            fallback_pool = interests + behavioral + other
+        else:
+            ordered.extend(interests[:2])
+            ordered.extend(behavioral[:1])
+            ordered.extend(other[:1])
+            fallback_pool = interests + behavioral + other
+
+        selected: list = []
+        seen: set[str] = set()
+        for memory in ordered + fallback_pool:
+            content = str(getattr(memory, "content", "") or "").strip().lower()
+            if not content or content in seen:
+                continue
+            seen.add(content)
+            selected.append(memory)
+            if len(selected) >= limit:
                 break
 
-        return [item["line"] for item in compact[:limit]]
+        breakdown: dict[str, int] = {}
+        for memory in selected:
+            memory_type = str(getattr(memory, "type", "") or "").strip().lower()
+            breakdown[memory_type] = breakdown.get(memory_type, 0) + 1
+        return selected, breakdown, goals_suppressed
+
+    @staticmethod
+    def _prepare_self_knowledge_memory_items(memories: list, limit: int = 6) -> list[dict[str, str]]:
+        items: list[dict[str, str]] = []
+        seen: set[str] = set()
+        for memory in memories:
+            memory_type = str(getattr(memory, "type", "") or "").strip().lower()
+            content = str(getattr(memory, "content", "") or "").strip()
+            line = FinanceEngine._paraphrase_memory(memory_type, content)
+            if not line:
+                continue
+            norm = re.sub(r"\s+", " ", line.lower()).strip(" .,!?:;")
+            if not norm or norm in seen:
+                continue
+            seen.add(norm)
+            items.append({"type": memory_type, "line": line.rstrip(".")})
+            if len(items) >= limit:
+                break
+        return items
+
+    @staticmethod
+    def _paraphrase_memory(memory_type: str, content: str) -> str:
+        text = re.sub(r"\s+", " ", str(content or "")).strip().strip(" .")
+        if not text:
+            return ""
+
+        lowered = text.lower()
+        if lowered.startswith("user "):
+            text = text[5:].strip()
+            lowered = text.lower()
+
+        if memory_type == "goal":
+            value = re.sub(r"^(?:goal\s*:|goal is to)\s*", "", text, flags=re.IGNORECASE).strip(" .")
+            value = re.split(r"\b(?:should i|can i|what should)\b", value, maxsplit=1, flags=re.IGNORECASE)[0].strip(" .")
+            if value.lower().startswith("to "):
+                value = value[3:].strip()
+            return f"your goal is to {value}" if value else ""
+
+        if memory_type in {"interest", "hobby"}:
+            value = re.sub(r"^(?:interest\s*:|hobby\s*:|hobbies\s*:|likes?\s*)", "", text, flags=re.IGNORECASE).strip(" .")
+            if value.lower().startswith("eat "):
+                value = "eating " + value[4:].strip()
+            return f"you enjoy {value}" if value else ""
+
+        if memory_type == "dislike":
+            value = re.sub(r"^(?:dislikes?\s*)", "", text, flags=re.IGNORECASE).strip(" .")
+            return f"you dislike {value}" if value else ""
+
+        if memory_type == "preference":
+            if re.match(r"^likes?\s+", text, flags=re.IGNORECASE):
+                value = re.sub(r"^likes?\s+", "", text, flags=re.IGNORECASE).strip(" .")
+                return f"you like {value}" if value else ""
+            if re.match(r"^prefers?\s+", text, flags=re.IGNORECASE):
+                value = re.sub(r"^prefers?\s+", "", text, flags=re.IGNORECASE).strip(" .")
+                return f"you prefer {value}" if value else ""
+            return f"you prefer {text.strip(' .')}"
+
+        if memory_type == "behavioral":
+            value = re.sub(r"^major spending categories\s*:\s*", "", text, flags=re.IGNORECASE).strip(" .")
+            return f"your major spending categories are {value}" if value else ""
+
+        if memory_type == "emotional":
+            value = re.sub(r"^emotional cue\s*:\s*", "", text, flags=re.IGNORECASE).strip(" .")
+            return value or ""
+
+        if memory_type == "assistant_note":
+            body = re.sub(r"^\s*assistant\s*note\s*:\s*", "", text, flags=re.IGNORECASE).strip(" .")
+            parts = [segment.strip() for segment in body.split(";") if segment.strip()]
+            summary = ""
+            pending = ""
+            for part in parts:
+                lowered = part.lower()
+                if lowered.startswith("summary="):
+                    summary = part.split("=", 1)[1].strip(" .")
+                elif lowered.startswith("pending_question="):
+                    pending = part.split("=", 1)[1].strip()
+            if summary and pending:
+                return f"earlier I suggested {summary} and asked {pending}"
+            if summary:
+                return f"earlier I suggested {summary}"
+            if pending:
+                return f"earlier I asked {pending}"
+            return ""
+
+        return text
 
     @staticmethod
     def _refresh_profile_snapshot(user_id: str, in_session_profile: dict | None) -> dict:
@@ -773,54 +1314,112 @@ class FinanceEngine:
         return count
 
     @staticmethod
-    def _build_self_knowledge_response(profile: dict, memories: list, response_channel: str) -> str:
-        points: list[str] = []
+    def _build_self_knowledge_response(profile: dict, memories: list, response_channel: str, focus: str = "general") -> str:
+        profile_bits: list[str] = []
         name = profile.get("preferred_name") or profile.get("full_name") or profile.get("name")
         city = profile.get("city")
         income = profile.get("monthly_income")
         expenses = profile.get("monthly_expenses")
         savings = profile.get("monthly_savings")
 
-        if name:
-            points.append(f"Name: {name}")
-        if city:
-            points.append(f"City: {city}")
         if income not in (None, ""):
-            points.append(f"Monthly income: INR {income}")
+            profile_bits.append(f"monthly income is INR {income}")
         if expenses not in (None, ""):
-            points.append(f"Monthly expenses: INR {expenses}")
+            profile_bits.append(f"monthly expenses are INR {expenses}")
         if savings not in (None, ""):
-            points.append(f"Monthly savings: INR {savings}")
+            profile_bits.append(f"monthly savings are INR {savings}")
+        if name:
+            profile_bits.insert(0, f"your name is {name}")
+        if city:
+            profile_bits.append(f"you are in {city}")
 
-        memory_lines = FinanceEngine._prepare_self_knowledge_memory_lines(memories, limit=6)
+        memory_items = FinanceEngine._prepare_self_knowledge_memory_items(memories, limit=6)
+        grouped: dict[str, list[str]] = {
+            "goal": [],
+            "interest": [],
+            "preference": [],
+            "dislike": [],
+            "behavioral": [],
+            "assistant_note": [],
+            "other": [],
+        }
+        for item in memory_items:
+            memory_type = item["type"]
+            line = item["line"]
+            if memory_type in grouped:
+                grouped[memory_type].append(line)
+            elif memory_type in {"hobby"}:
+                grouped["interest"].append(line)
+            else:
+                grouped["other"].append(line)
+        if focus != "assistant_recall":
+            grouped["assistant_note"] = []
+        effective_focus = focus
+        if focus == "assistant_recall" and not grouped["assistant_note"]:
+            effective_focus = "profile"
 
         if response_channel == "voice":
-            if not points and not memory_lines:
+            if not profile_bits and not memory_items:
                 return "I only know limited details so far. You can share your preferences and I'll remember them."
-            summary_bits = []
-            if name:
-                summary_bits.append(f"your name is {name}")
-            if city:
-                summary_bits.append(f"you are in {city}")
-            if income not in (None, ""):
-                summary_bits.append(f"your monthly income is INR {income}")
-            if expenses not in (None, ""):
-                summary_bits.append(f"your monthly expenses are INR {expenses}")
-            if savings not in (None, ""):
-                summary_bits.append(f"your monthly savings are INR {savings}")
-            if memory_lines:
-                summary_bits.append(memory_lines[0].rstrip("."))
-            if not summary_bits:
+
+            facts_used = 0
+            parts: list[str] = []
+            if profile_bits:
+                selected_profile = profile_bits[:3]
+                facts_used += len(selected_profile)
+                parts.append("Profile: " + ", ".join(selected_profile))
+
+            memory_sentences: list[str] = []
+            if effective_focus == "assistant_recall":
+                memory_sentences.extend(grouped["assistant_note"][:3])
+            elif effective_focus == "goal":
+                memory_sentences.extend(grouped["goal"][:2])
+                memory_sentences.extend(grouped["interest"][:1])
+            elif effective_focus == "interest":
+                memory_sentences.extend(grouped["interest"][:2])
+                memory_sentences.extend(grouped["preference"][:2])
+            elif effective_focus == "profile":
+                memory_sentences.extend(grouped["interest"][:3])
+                memory_sentences.extend(grouped["preference"][:2])
+                memory_sentences.extend(grouped["dislike"][:1])
+                memory_sentences.extend(grouped["behavioral"][:1])
+            else:
+                memory_sentences.extend(grouped["interest"][:2])
+                memory_sentences.extend(grouped["preference"][:1])
+                memory_sentences.extend(grouped["dislike"][:1])
+                memory_sentences.extend(grouped["behavioral"][:1])
+
+            memory_sentences = [item for item in memory_sentences if item]
+            non_profile_limit = max(1, 6 - facts_used)
+            selected_memory = memory_sentences[:non_profile_limit]
+            if selected_memory:
+                facts_used += len(selected_memory)
+                if effective_focus == "assistant_recall":
+                    parts.append("Earlier suggestions: " + "; ".join(selected_memory))
+                else:
+                    parts.append("Personal details: " + "; ".join(selected_memory))
+
+            if not parts:
                 return "I only know limited details so far. You can share your preferences and I'll remember them."
-            return "I know that " + ", and ".join(summary_bits) + "."
+            return "Here is what I know: " + ". ".join(parts) + "."
 
         lines = ["Here is what I currently know about you:"]
-        for point in points:
-            lines.append(f"- {point}")
-        for item in memory_lines:
-            lines.append(f"- {item}")
+        if profile_bits:
+            lines.append(f"- Profile: {', '.join(profile_bits[:4])}.")
+        if effective_focus == "assistant_recall":
+            if grouped["assistant_note"]:
+                lines.append(f"- Earlier suggestions: {'; '.join(grouped['assistant_note'][:3])}.")
+        elif effective_focus == "goal" and grouped["goal"]:
+            lines.append(f"- Goals: {'; '.join(grouped['goal'][:2])}.")
+        interests = grouped["interest"] + grouped["preference"] + grouped["dislike"]
+        if interests:
+            lines.append(f"- Interests and preferences: {'; '.join(interests[:3])}.")
+        if grouped["behavioral"]:
+            lines.append(f"- Behavior notes: {'; '.join(grouped['behavioral'][:2])}.")
+        if grouped["other"]:
+            lines.append(f"- Other notes: {'; '.join(grouped['other'][:2])}.")
 
         if len(lines) == 1:
             lines.append("- I have only limited details so far.")
-            lines.append("- Share your likes, goals, and preferences and I will remember them.")
+            lines.append("- Share your goals, hobbies, and preferences and I will remember them.")
         return "\n".join(lines)

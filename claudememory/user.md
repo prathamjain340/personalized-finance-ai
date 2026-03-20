@@ -1,6 +1,6 @@
 # User And Project Snapshot
 
-Last updated: 2026-03-18
+Last updated: 2026-03-17
 
 ## Project Purpose
 - Voice-first personal finance assistant API.
@@ -8,6 +8,7 @@ Last updated: 2026-03-18
 
 ## Runtime Surface
 - FastAPI app import: `finance_project.main:app`
+- Start: `python -m uvicorn finance_project.main:app --host 127.0.0.1 --port 9003`
 - Core routes:
   - `POST /finance/session/init`
   - `POST /finance/session/ask`
@@ -20,8 +21,8 @@ Last updated: 2026-03-18
 - `finance_project/domains/finance/intent.py`: turn control (routing, profile extraction, live-data intent).
 - `finance_project/domains/finance/engine.py`: end-to-end decision flow and prompt execution.
 - `finance_project/domains/finance/prompt/`: prompt assembly and policy blocks.
-- `finance_project/services/live_data_service.py`: weather/stock/news fetchers.
-- `finance_project/services/live_data_search.py`: optional web-search augmentation.
+- `finance_project/services/live_data_service.py`: weather/stock/news/commodity fetchers with provider-chain fallback.
+- `finance_project/services/live_data_search.py`: DuckDuckGo web-search fallback.
 - `finance_project/services/audio_service.py`: STT + TTS.
 - `finance_project/core/postprocess/dispatcher.py`: async profile/memory write pipeline.
 - `finance_project/services/memory_extraction_service.py`: LLM-based durable memory extraction.
@@ -30,10 +31,8 @@ Last updated: 2026-03-18
 - Improve profile-first personalization (income, expenses, savings, investments).
 - Prevent wrong live-data jumps when user shares profile values.
 - Keep high answer quality while expanding live coverage through hybrid routing.
-- Improve live-data reliability consistency (especially history/gold paths) with generalized provider-chain fallback.
-- Keep self-knowledge replies in "normal profile memory" style (core profile + hobbies/interests), without assistant-suggestion leakage.
-- Keep implementation model-driven and avoid hardcoded phrase/keyword gates where possible.
-- Keep assistant-response note storage bounded (recent-window retention) so long conversations do not bloat memory.
+- Commodity prices (silver, oil, etc.) now route to `commodity` live_data_kind → web fallback for accurate live data.
+- Stock/history equity resolution failures now fall through to web fallback instead of dead-ending.
 
 ## Workspace Baseline
 - Canonical working copy: root project folder (`finance_project/` package within repository root).
